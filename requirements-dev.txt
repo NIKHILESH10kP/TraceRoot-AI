@@ -1,0 +1,4 @@
+# Development and testing dependencies for TraceRoot AI
+-r requirements.txt
+pytest>=8.0.0,<9.0.0
+
