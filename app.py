@@ -1,15 +1,18 @@
 """
-TraceRoot AI - Log Monitoring & Error Spike Detection Dashboard
-(Milestone 1 Baseline + Milestone 2 Dynamic Event Simulation & Rolling Spike Detection)
+TraceRoot AI - Log Monitoring, Error Spike Detection & Log File Ingestion Dashboard
+(Milestone 1 Baseline + Milestone 2 Event Simulation + Milestone 3 Log-File Ingestion)
 
-This dashboard displays SIMULATED log data only. It does not read real
-application logs, and nothing here is live monitoring of production systems.
+This dashboard supports dual data sources:
+1. In-memory simulated demonstration logs with dynamic event & spike generation.
+2. Real user-uploaded .log (plain text) and .jsonl (JSON Lines) log files.
 
 Run with:
     python -m streamlit run app.py
 """
 
+import json
 import random
+import re
 import time
 import pandas as pd
 import streamlit as st
@@ -44,7 +47,22 @@ SPIKE_COLUMNS = [
     "explanation",
 ]
 
-# Monitored microservices
+# --- Milestone 3: Ingestion Limits and Regex Patterns ---
+MAX_UPLOAD_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB file size limit
+MAX_UPLOAD_RECORDS = 5000                 # Maximum imported records cap
+VALID_LOG_LEVELS = {"INFO": "INFO", "WARNING": "WARNING", "WARN": "WARNING", "ERROR": "ERROR"}
+
+# Regex matching standard text logs:
+# e.g.: 2026-10-29 10:15:30 ERROR payment-service Database connection timeout
+# Also supports ISO timestamps (2026-10-29T10:15:30Z) and bracketed levels ([ERROR])
+LOG_LINE_PATTERN = re.compile(
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+"
+    r"\[?(?P<level>[A-Za-z]+)\]?\s+"
+    r"(?P<service>[A-Za-z0-9_\-\.]+)\s+"
+    r"(?P<message>.+)$"
+)
+
+# Monitored microservices (default cohort for simulation)
 SERVICES = [
     "api-gateway",
     "auth-service",
@@ -166,7 +184,7 @@ MESSAGE_TEMPLATES = {
 
 
 # ---------------------------------------------------------------------------
-# Data Baseline & Dynamic Generation
+# Data Baseline & Dynamic Generation (Milestone 1 & 2)
 # ---------------------------------------------------------------------------
 def load_sample_logs() -> pd.DataFrame:
     """Return a DataFrame of the baseline simulated log records (24 original records)."""
@@ -306,6 +324,272 @@ def append_and_cap_logs(
         combined = combined.iloc[-max_records:].reset_index(drop=True)
 
     return combined
+
+
+# ---------------------------------------------------------------------------
+# Milestone 3: Real Log-File Ingestion & Parsing (Pure Functions)
+# ---------------------------------------------------------------------------
+def parse_log_text(text: str) -> tuple[pd.DataFrame, dict]:
+    """Parse line-delimited plain text log records into a normalized DataFrame.
+
+    Expected line format:
+        <timestamp> <level> <service> <message>
+    Example:
+        2026-10-29 10:15:30 ERROR payment-service Database connection timeout
+    """
+    records = []
+    errors = []
+    blank_lines = 0
+
+    lines = text.splitlines()
+    total_lines = len(lines)
+
+    for line_idx, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line:
+            blank_lines += 1
+            continue
+
+        match = LOG_LINE_PATTERN.match(line)
+        if not match:
+            errors.append({
+                "line": line_idx,
+                "reason": "Line does not match format '<timestamp> <level> <service> <message>'",
+                "content": line[:100],
+            })
+            continue
+
+        raw_ts = match.group("timestamp")
+        raw_level = match.group("level").upper()
+        service = match.group("service").strip()
+        message = match.group("message").strip()
+
+        # Validate level
+        if raw_level not in VALID_LOG_LEVELS:
+            errors.append({
+                "line": line_idx,
+                "reason": f"Unsupported severity level '{match.group('level')}'. Allowed: INFO, WARNING, ERROR",
+                "content": line[:100],
+            })
+            continue
+        level = VALID_LOG_LEVELS[raw_level]
+
+        # Validate timestamp
+        try:
+            parsed_ts = pd.to_datetime(raw_ts)
+            if hasattr(parsed_ts, "tz") and parsed_ts.tz is not None:
+                parsed_ts = parsed_ts.tz_localize(None)
+            if pd.isna(parsed_ts):
+                raise ValueError("Parsed timestamp is NaT")
+        except Exception as e:
+            errors.append({
+                "line": line_idx,
+                "reason": f"Invalid timestamp '{raw_ts}': {e}",
+                "content": line[:100],
+            })
+            continue
+
+        if not service:
+            errors.append({
+                "line": line_idx,
+                "reason": "Missing required service identifier",
+                "content": line[:100],
+            })
+            continue
+
+        if not message:
+            errors.append({
+                "line": line_idx,
+                "reason": "Log message body cannot be empty",
+                "content": line[:100],
+            })
+            continue
+
+        records.append({
+            "timestamp": parsed_ts,
+            "level": level,
+            "service": service,
+            "message": message,
+        })
+
+    # Capping to prevent memory pressure
+    was_capped = False
+    if len(records) > MAX_UPLOAD_RECORDS:
+        records = records[:MAX_UPLOAD_RECORDS]
+        was_capped = True
+
+    if records:
+        df = pd.DataFrame(records, columns=["timestamp", "level", "service", "message"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.sort_values("timestamp").reset_index(drop=True)
+    else:
+        df = pd.DataFrame(columns=["timestamp", "level", "service", "message"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+    summary = {
+        "total_lines": total_lines,
+        "valid_records": len(df),
+        "rejected_records": len(errors),
+        "blank_lines": blank_lines,
+        "errors": errors,
+        "file_type": "text/log",
+        "capped": was_capped,
+    }
+    return df, summary
+
+
+def parse_jsonl_text(text: str) -> tuple[pd.DataFrame, dict]:
+    """Parse JSON Lines formatted records into a normalized DataFrame.
+
+    Each line must be a valid JSON object containing:
+        - timestamp (or time, ts)
+        - level (or severity, log_level)
+        - service (or service_name, app)
+        - message (or msg)
+    """
+    records = []
+    errors = []
+    blank_lines = 0
+
+    lines = text.splitlines()
+    total_lines = len(lines)
+
+    for line_idx, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line:
+            blank_lines += 1
+            continue
+
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError as err:
+            errors.append({
+                "line": line_idx,
+                "reason": f"Malformed JSON: {err.msg}",
+                "content": line[:100],
+            })
+            continue
+
+        if not isinstance(data, dict):
+            errors.append({
+                "line": line_idx,
+                "reason": "JSON line is not an object/dictionary",
+                "content": line[:100],
+            })
+            continue
+
+        # Extract timestamp
+        raw_ts = data.get("timestamp") or data.get("time") or data.get("ts")
+        if not raw_ts:
+            errors.append({
+                "line": line_idx,
+                "reason": "Missing required field 'timestamp' (or 'time'/'ts')",
+                "content": line[:100],
+            })
+            continue
+
+        try:
+            parsed_ts = pd.to_datetime(raw_ts)
+            if hasattr(parsed_ts, "tz") and parsed_ts.tz is not None:
+                parsed_ts = parsed_ts.tz_localize(None)
+            if pd.isna(parsed_ts):
+                raise ValueError("Parsed timestamp is NaT")
+        except Exception as e:
+            errors.append({
+                "line": line_idx,
+                "reason": f"Invalid timestamp '{raw_ts}': {e}",
+                "content": line[:100],
+            })
+            continue
+
+        # Extract level
+        raw_level = data.get("level") or data.get("severity") or data.get("log_level")
+        if not raw_level or not isinstance(raw_level, str) or not raw_level.strip():
+            errors.append({
+                "line": line_idx,
+                "reason": "Missing required field 'level' (or 'severity')",
+                "content": line[:100],
+            })
+            continue
+
+        clean_level = raw_level.strip().upper().strip("[]")
+        if clean_level not in VALID_LOG_LEVELS:
+            errors.append({
+                "line": line_idx,
+                "reason": f"Unsupported severity level '{raw_level}'. Allowed: INFO, WARNING, ERROR",
+                "content": line[:100],
+            })
+            continue
+        level = VALID_LOG_LEVELS[clean_level]
+
+        # Extract service
+        raw_service = data.get("service") or data.get("service_name") or data.get("app")
+        if not raw_service or not isinstance(raw_service, str) or not raw_service.strip():
+            errors.append({
+                "line": line_idx,
+                "reason": "Missing required field 'service' (or 'service_name'/'app')",
+                "content": line[:100],
+            })
+            continue
+        service = raw_service.strip()
+
+        # Extract message
+        raw_message = data.get("message") or data.get("msg")
+        if raw_message is None or not str(raw_message).strip():
+            errors.append({
+                "line": line_idx,
+                "reason": "Missing required field 'message' (or 'msg')",
+                "content": line[:100],
+            })
+            continue
+        message = str(raw_message).strip()
+
+        records.append({
+            "timestamp": parsed_ts,
+            "level": level,
+            "service": service,
+            "message": message,
+        })
+
+    # Capping
+    was_capped = False
+    if len(records) > MAX_UPLOAD_RECORDS:
+        records = records[:MAX_UPLOAD_RECORDS]
+        was_capped = True
+
+    if records:
+        df = pd.DataFrame(records, columns=["timestamp", "level", "service", "message"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.sort_values("timestamp").reset_index(drop=True)
+    else:
+        df = pd.DataFrame(columns=["timestamp", "level", "service", "message"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+    summary = {
+        "total_lines": total_lines,
+        "valid_records": len(df),
+        "rejected_records": len(errors),
+        "blank_lines": blank_lines,
+        "errors": errors,
+        "file_type": "jsonl",
+        "capped": was_capped,
+    }
+    return df, summary
+
+
+def parse_uploaded_log_file(content: str, filename: str = "") -> tuple[pd.DataFrame, dict]:
+    """Parse uploaded content, automatically detecting JSONL or text .log format."""
+    lower_name = filename.lower()
+    if lower_name.endswith(".jsonl"):
+        return parse_jsonl_text(content)
+    elif lower_name.endswith((".log", ".txt")):
+        return parse_log_text(content)
+
+    # Auto-detect from first non-empty line
+    stripped = content.lstrip()
+    if stripped.startswith("{"):
+        return parse_jsonl_text(content)
+    return parse_log_text(content)
 
 
 # ---------------------------------------------------------------------------
@@ -532,19 +816,104 @@ def detect_rolling_error_spikes(
 # ---------------------------------------------------------------------------
 # Dashboard UI Rendering Sections
 # ---------------------------------------------------------------------------
-def show_header(latest_time: pd.Timestamp = None, total_records: int = 0) -> None:
-    """Draw the application header and simulation notices."""
+def show_header(
+    latest_time: pd.Timestamp = None,
+    total_records: int = 0,
+    data_source_mode: str = "simulated",
+    uploaded_filename: str = "",
+) -> None:
+    """Draw the application header and simulation / ingestion notices."""
     st.title("TraceRoot AI")
     st.subheader("Intelligent Application Failure Detection & Root Cause Analysis System")
-    st.warning(
-        "⚠️ **Simulated Demonstration Environment.** All logs below are simulated records "
-        "generated in-memory. This dashboard does NOT connect to a live production cluster or external database."
-    )
-    if latest_time is not None:
-        st.caption(
-            f"📅 **Latest Event Time:** `{latest_time.strftime('%Y-%m-%d %H:%M:%S')}` | "
-            f"📊 **Cumulative Session Log Records:** `{total_records}`"
+
+    if data_source_mode == "simulated":
+        st.warning(
+            "⚠️ **Simulated Demonstration Environment.** All logs below are simulated records "
+            "generated in-memory. This dashboard does NOT connect to a live production cluster or external database."
         )
+    else:
+        st.info(
+            f"📂 **Active Data Source: Uploaded Log File (`{uploaded_filename or 'No file loaded'}`).** "
+            "Analyzing user-provided log records in-memory for this session."
+        )
+
+    if latest_time is not None:
+        source_label = "Simulated Event Stream" if data_source_mode == "simulated" else f"Uploaded File ({uploaded_filename})"
+        st.caption(
+            f"📅 **Latest Record Time:** `{latest_time.strftime('%Y-%m-%d %H:%M:%S')}` | "
+            f"📊 **Total Active Records:** `{total_records}` | "
+            f"🏷️ **Source:** `{source_label}`"
+        )
+
+
+def show_data_source_controls():
+    """Draw data source selection and file uploader in sidebar."""
+    st.sidebar.header("📁 Data Source Selection")
+    source_choice = st.sidebar.radio(
+        "Choose Active Data Source:",
+        options=["Simulated Demonstration Logs", "Uploaded Log File"],
+        index=0 if st.session_state.get("data_source_mode", "simulated") == "simulated" else 1,
+        help="Switch between synthetic demonstration logs and real ingested .log / .jsonl files.",
+    )
+    current_mode = "simulated" if source_choice == "Simulated Demonstration Logs" else "uploaded"
+    st.session_state["data_source_mode"] = current_mode
+
+    if current_mode == "uploaded":
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("Upload Real Log File (Milestone 3)")
+        uploaded_file = st.sidebar.file_uploader(
+            "Upload .log or .jsonl file",
+            type=["log", "jsonl", "txt"],
+            help="Upload plain text .log files or JSON Lines .jsonl files (max 5 MB / 5,000 records).",
+        )
+
+        if uploaded_file is not None:
+            # Check file size limit
+            if uploaded_file.size > MAX_UPLOAD_SIZE_BYTES:
+                st.sidebar.error(f"File too large! Max file size is {MAX_UPLOAD_SIZE_BYTES // (1024*1024)} MB.")
+            else:
+                # Avoid re-parsing the exact same file upload on every rerun
+                last_name = st.session_state.get("uploaded_file_name")
+                if last_name != uploaded_file.name or st.session_state.get("uploaded_logs_df") is None:
+                    try:
+                        raw_content = uploaded_file.getvalue().decode("utf-8", errors="replace")
+                        parsed_df, summary = parse_uploaded_log_file(raw_content, filename=uploaded_file.name)
+                        st.session_state["uploaded_logs_df"] = parsed_df
+                        st.session_state["uploaded_file_summary"] = summary
+                        st.session_state["uploaded_file_name"] = uploaded_file.name
+                    except Exception as e:
+                        st.sidebar.error(f"Error parsing file: {e}")
+
+        # Display clear file button if uploaded file exists
+        if st.session_state.get("uploaded_logs_df") is not None:
+            if st.sidebar.button("🗑️ Clear Uploaded File"):
+                st.session_state["uploaded_logs_df"] = None
+                st.session_state["uploaded_file_summary"] = None
+                st.session_state["uploaded_file_name"] = None
+                st.rerun()
+
+    return current_mode
+
+
+def show_upload_summary_banner(summary: dict, filename: str) -> None:
+    """Display an import summary card for uploaded log files."""
+    st.subheader(f"📄 Ingestion Report: `{filename}`")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Lines Processed", summary["total_lines"])
+    col2.metric("Valid Records Imported", summary["valid_records"])
+    col3.metric("Rejected Lines", summary["rejected_records"])
+    col4.metric("Blank Lines Ignored", summary["blank_lines"])
+
+    if summary.get("capped"):
+        st.warning(f"⚠️ File exceeded {MAX_UPLOAD_RECORDS} records. Imported first {MAX_UPLOAD_RECORDS} records.")
+
+    if summary["rejected_records"] > 0:
+        with st.expander(f"⚠️ View {summary['rejected_records']} Rejected Line(s) & Validation Errors"):
+            error_rows = [
+                {"Line #": err["line"], "Validation Error": err["reason"], "Content Preview": err["content"]}
+                for err in summary["errors"]
+            ]
+            st.dataframe(pd.DataFrame(error_rows), hide_index=True)
 
 
 def show_summary_metrics(logs: pd.DataFrame, is_filtered: bool = False) -> None:
@@ -553,7 +922,7 @@ def show_summary_metrics(logs: pd.DataFrame, is_filtered: bool = False) -> None:
     if is_filtered:
         st.caption("Reflecting current sidebar filter selections.")
     else:
-        st.caption("Reflecting all active simulated logs.")
+        st.caption("Reflecting all active log records.")
 
     summary = calculate_summary(logs)
     col_total, col_errors, col_warnings, col_services = st.columns(4)
@@ -592,6 +961,15 @@ def show_simulation_controls(current_logs: pd.DataFrame):
         st.session_state["logs_df"] = updated
         st.rerun()
 
+    auto_stream = st.sidebar.toggle("⏱️ Auto-Stream Events (every 4s)", value=False)
+    if auto_stream:
+        st.sidebar.info("🔴 Streaming active. Click toggle to pause.")
+
+    return auto_stream
+
+
+def show_spike_detection_parameters():
+    """Draw rolling spike detection parameter controls in sidebar."""
     st.sidebar.markdown("---")
     st.sidebar.subheader("Spike Detection Parameters")
     window_minutes = st.sidebar.slider(
@@ -600,16 +978,12 @@ def show_simulation_controls(current_logs: pd.DataFrame):
     error_threshold = st.sidebar.slider(
         "Spike Error Threshold", min_value=1, max_value=15, value=DEFAULT_SPIKE_ERROR_THRESHOLD, step=1
     )
-
-    auto_stream = st.sidebar.toggle("⏱️ Auto-Stream Events (every 4s)", value=False)
-    if auto_stream:
-        st.sidebar.info("🔴 Streaming active. Click toggle to pause.")
-
-    return window_minutes, error_threshold, auto_stream
+    return window_minutes, error_threshold
 
 
 def show_sidebar_filters(logs: pd.DataFrame):
     """Draw filter controls in the sidebar and return user selections."""
+    st.sidebar.markdown("---")
     st.sidebar.header("Log Filters")
     selected_levels = st.sidebar.multiselect(
         "Log level", options=LOG_LEVELS, default=LOG_LEVELS
@@ -800,45 +1174,102 @@ def show_anomaly_detection(filtered_logs: pd.DataFrame) -> None:
 def main() -> None:
     st.set_page_config(page_title="TraceRoot AI", page_icon="🔍", layout="wide")
 
-    # Initialize session state with baseline sample logs if not present
+    # Initialize session state stores
     if "logs_df" not in st.session_state:
         st.session_state["logs_df"] = load_sample_logs()
 
-    all_logs = st.session_state["logs_df"]
-    latest_time = all_logs["timestamp"].max() if not all_logs.empty else None
+    if "uploaded_logs_df" not in st.session_state:
+        st.session_state["uploaded_logs_df"] = None
 
-    # Header
-    show_header(latest_time=latest_time, total_records=len(all_logs))
+    if "uploaded_file_summary" not in st.session_state:
+        st.session_state["uploaded_file_summary"] = None
 
-    # Sidebar: Simulation Controls & Spike Detection Settings
-    window_minutes, error_threshold, auto_stream = show_simulation_controls(all_logs)
+    if "uploaded_file_name" not in st.session_state:
+        st.session_state["uploaded_file_name"] = None
 
-    # Sidebar: Filters
-    selected_levels, selected_services = show_sidebar_filters(all_logs)
-    filtered_logs = filter_logs(all_logs, selected_levels, selected_services)
+    # Step 1: Sidebar Data Source Selector
+    mode = show_data_source_controls()
 
-    # Summary Metrics (reflecting active filtered selection)
-    is_filtered = len(filtered_logs) != len(all_logs)
+    # Step 2: Determine Active Dataset (Strictly Separated)
+    if mode == "uploaded":
+        uploaded_df = st.session_state.get("uploaded_logs_df")
+        if uploaded_df is not None and not uploaded_df.empty:
+            active_logs = uploaded_df
+            uploaded_name = st.session_state.get("uploaded_file_name", "custom_log")
+        else:
+            active_logs = pd.DataFrame(columns=["timestamp", "level", "service", "message"])
+            uploaded_name = ""
+    else:
+        active_logs = st.session_state["logs_df"]
+        uploaded_name = ""
+
+    latest_time = active_logs["timestamp"].max() if not active_logs.empty else None
+
+    # Step 3: Header Display
+    show_header(
+        latest_time=latest_time,
+        total_records=len(active_logs),
+        data_source_mode=mode,
+        uploaded_filename=uploaded_name,
+    )
+
+    # Step 4: Mode-Specific Top Banners
+    if mode == "uploaded":
+        summary = st.session_state.get("uploaded_file_summary")
+        if summary is not None:
+            show_upload_summary_banner(summary, uploaded_name)
+        else:
+            st.info("📂 **No file uploaded yet.** Use the sidebar file uploader to load your `.log` or `.jsonl` file.")
+            with st.expander("📖 Supported Log File Formats & Examples"):
+                st.markdown(
+                    "TraceRoot AI accepts two structured file formats:\n\n"
+                    "#### 1. Plain Text Log (`.log` or `.txt`)\n"
+                    "One record per line in the format: `<timestamp> <level> <service> <message>`\n"
+                    "```text\n"
+                    "2026-10-29 10:15:30 ERROR payment-service Database connection timeout after 30s\n"
+                    "2026-10-29 10:15:45 INFO api-gateway GET /api/orders returned 200 OK in 45ms\n"
+                    "2026-10-29 10:16:10 WARNING auth-service Slow token verification took 1200ms\n"
+                    "```\n\n"
+                    "#### 2. JSON Lines (`.jsonl`)\n"
+                    "One valid JSON object per line with `timestamp`, `level`, `service`, and `message`:\n"
+                    "```json\n"
+                    '{"timestamp": "2026-10-29 10:15:30", "level": "ERROR", "service": "payment-service", "message": "Database connection timeout"}\n'
+                    '{"timestamp": "2026-10-29 10:15:45", "level": "INFO", "service": "api-gateway", "message": "GET /api/orders returned 200 OK"}\n'
+                    "```"
+                )
+    else:
+        # Simulation Controls in sidebar only available when in simulated mode
+        auto_stream = show_simulation_controls(active_logs)
+
+    # Step 5: Spike Detection Sliders (Available for both modes)
+    window_minutes, error_threshold = show_spike_detection_parameters()
+
+    # Step 6: Sidebar Filters (Derives options from active_logs)
+    selected_levels, selected_services = show_sidebar_filters(active_logs)
+    filtered_logs = filter_logs(active_logs, selected_levels, selected_services)
+
+    # Step 7: Core Visualizations & Analytics
+    is_filtered = len(filtered_logs) != len(active_logs)
     show_summary_metrics(filtered_logs, is_filtered=is_filtered)
 
-    # Milestone 2: Real-Time Rolling Error Spike Detection
+    # Real-Time Rolling Error Spike Detection
     show_error_spike_section(filtered_logs, window_minutes=window_minutes, error_threshold=error_threshold)
 
-    # Core Log Visualizer & Table
+    # Tabular Log Explorer & Severity Chart
     show_log_table_and_chart(filtered_logs)
 
-    # Error Investigation
+    # Error Investigation & Triage Guidance
     show_error_investigation(filtered_logs)
 
-    # Milestone 1: Cohort Anomaly Detection
+    # Cohort Statistical Anomaly Detection
     show_anomaly_detection(filtered_logs)
 
-    # Auto-streaming handler: sleeps and reruns safely if toggle is active
-    if auto_stream:
+    # Auto-streaming handler: only executes in simulated mode
+    if mode == "simulated" and auto_stream:
         time.sleep(4)
-        latest_ts = all_logs["timestamp"].max() if not all_logs.empty else pd.Timestamp.now()
+        latest_ts = active_logs["timestamp"].max() if not active_logs.empty else pd.Timestamp.now()
         new_batch = generate_simulated_logs(base_time=latest_ts, count=2)
-        st.session_state["logs_df"] = append_and_cap_logs(all_logs, new_batch)
+        st.session_state["logs_df"] = append_and_cap_logs(active_logs, new_batch)
         st.rerun()
 
 

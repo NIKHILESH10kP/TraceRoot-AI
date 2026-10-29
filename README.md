@@ -5,28 +5,37 @@
 TraceRoot AI is an application monitoring and failure investigation platform designed to analyze application logs, detect abnormal error patterns, correlate evidence across services, rank probable root causes, and recommend corrective actions.
 
 > [!NOTE]
-> **Prototype Status:** TraceRoot AI is currently in **Milestone 2** (Dynamic Event Simulation & Rolling Error-Spike Detection). All log data shown in the dashboard is **simulated demonstration data**. The platform does not yet connect to live applications, external log pipelines, or cloud production databases.
+> **Prototype Status:** TraceRoot AI is currently in **Milestone 3** (Dual Data Sources: Dynamic Event Simulation + Real Log-File Ingestion). The platform supports both in-memory synthetic demonstration streams and user-uploaded `.log` / `.jsonl` files. It does not yet connect to live streaming infrastructure or external production databases.
 
 ---
 
 ## Current Features
 
-### 1. Dynamic Log Simulation (Milestone 2)
+### 1. Real Log-File Ingestion (Milestone 3)
+- **Supported File Formats:** Ingest real application logs via `.log`, `.txt`, and `.jsonl` (JSON Lines) files.
+- **Strict Format Validation:**
+  - **Text Logs (`.log` / `.txt`):** Format: `<timestamp> <level> <service> <message>`. Example:  
+    `2026-10-29 10:15:30 ERROR payment-service Database connection timeout`
+  - **JSON Lines (`.jsonl`):** One JSON object per line with required fields `timestamp`, `level`, `service`, and `message` (supporting common key aliases like `time`/`ts`, `severity`, `app`/`service_name`, and `msg`).
+- **Comprehensive Ingestion Report:** Surfaces total lines processed, valid imported records, rejected lines with line numbers and exact failure reasons, and blank lines ignored.
+- **Data Source Isolation:** Explicit toggle between *Simulated Demonstration Logs* and *Uploaded Log File*. Uploaded records are never mixed with synthetic data.
+- **Safety & Performance Guardrails:** 5 MB file size limit, 5,000 record maximum import cap, in-memory session processing (no disk persistence or code execution).
+
+### 2. Dynamic Log Simulation (Milestone 2)
 - **Interactive Batch Generation:** Add batches of 5 realistic, timestamped events across 6 core microservices (`api-gateway`, `auth-service`, `order-service`, `payment-service`, `database-proxy`, `deployment-service`).
 - **Simulate Error Spike Scenario:** Inject concentrated error bursts (5 rapid errors in under 90 seconds) for any selected microservice to simulate active outages.
 - **Controlled Auto-Streaming:** Toggle continuous simulated event streaming (every 4 seconds) with controlled rate-limiting and one-click pause.
-- **Session State Persistence & Bounded Storage:** Retains simulated logs across filter adjustments in Streamlit session state, with a safe 500-record cap to prevent unbounded memory usage.
+- **Session State Persistence & Bounded Storage:** Retains simulated logs across filter adjustments in Streamlit session state, with a safe 500-record cap.
 - **One-Click Baseline Reset:** Instantly revert to the original 24-record baseline.
 
-### 2. Real-Time Rolling Error-Spike Detection (Milestone 2)
-- **Temporal Velocity Analysis:** Evaluates error rates within a configurable rolling window (e.g., last 10 minutes) rather than static historical totals.
+### 3. Real-Time Rolling Error-Spike Detection (Milestone 2)
+- **Temporal Velocity Analysis:** Evaluates error rates within a configurable rolling window (e.g., last 10 minutes) rather than static historical totals. Works seamlessly on both simulated and uploaded logs.
 - **Dynamic Alerting:** Alerts trigger when error count meets or exceeds the threshold:
   - **High:** Error count reaches threshold within window.
   - **Critical:** Error count is at least double ($\ge 2\times$) the threshold.
 - **Configurable Parameters:** Adjust the rolling window (1–60 minutes) and error threshold (1–15 errors) dynamically in the sidebar.
-- **Anomaly Disclaimer:** Explicitly presents spikes as anomalous operational symptoms, avoiding premature root cause claims.
 
-### 3. Log Analytics & Visualization (Milestone 1 Baseline)
+### 4. Log Analytics & Visualization (Milestone 1 Baseline)
 - **Summary Metrics:** Dynamic counters for Total Records, ERRORs, WARNINGs, and Unique Services, with latest event timestamp.
 - **Multi-Attribute Filters:** Filter records simultaneously by severity (`INFO`, `WARNING`, `ERROR`) and service.
 - **Side-by-Side Explorer:** Synchronized tabular log explorer and horizontal severity distribution chart.
@@ -105,7 +114,7 @@ Streamlit will launch a local web server (typically at `http://localhost:8501`) 
 
 ## Running Automated Tests
 
-TraceRoot AI includes an automated unit test suite with **29 passing tests** covering analytical functions, dynamic event generation, bounded memory storage, and rolling spike detection.
+TraceRoot AI includes an automated unit test suite with **43 passing tests** covering analytical functions, dynamic event generation, log parsing (.log and .jsonl), input validation, dataset isolation, and rolling spike detection.
 
 Run the tests using `pytest`:
 
@@ -123,7 +132,7 @@ pytest -v
 
 ## Current Architecture & Limitations
 
-- **Simulated In-Memory Data:** All records are generated in memory and tracked in Streamlit session state. Closing the browser tab resets the simulation to the 24-record baseline.
+- **Session-Local In-Memory Data:** Uploaded files and simulated records are processed in memory during the browser session. Closing the browser tab resets the simulation to the 24-record baseline and clears uploaded files (no disk persistence).
 - **Rule-Based Heuristics:** Spike detection relies on rolling time windows and count thresholds rather than AI / machine learning models.
 - **No External Services:** No database, external API, authentication layer, or cloud log stream integrations are connected in this milestone.
 
@@ -133,8 +142,8 @@ pytest -v
 
 1. **Milestone 1:** Basic log monitoring dashboard with simulated data *(Completed)*
 2. **Milestone 2:** Dynamic simulated log generation and rolling time-window error-spike detection *(Completed)*
-3. **Milestone 3:** Evidence-based AI root cause analysis using LLM reasoning and pattern clustering
-4. **Milestone 4:** Incident timeline construction, severity scoring, and mitigation recommendations
-5. **Milestone 5:** Database integration (PostgreSQL / SQLite), Docker containerization, and CI/CD pipelines
-6. **Milestone 6:** Real-time log ingestion via OpenTelemetry, WebSockets, or Fluentd
-7. **Milestone 7:** Automated DevOps remediation hooks and incident ticketing workflows
+3. **Milestone 3:** Real log-file ingestion (.log and .jsonl) with validation and triage *(Completed)*
+4. **Milestone 4:** Evidence-based AI root cause analysis using LLM reasoning and pattern clustering
+5. **Milestone 5:** Incident timeline construction, severity scoring, and mitigation recommendations
+6. **Milestone 6:** Database integration (PostgreSQL / SQLite), Docker containerization, and CI/CD pipelines
+7. **Milestone 7:** Real-time log streaming via OpenTelemetry, WebSockets, or Fluentd
