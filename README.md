@@ -5,26 +5,33 @@
 TraceRoot AI is an application monitoring and failure investigation platform designed to analyze application logs, detect abnormal error patterns, correlate evidence across services, rank probable root causes, and recommend corrective actions.
 
 > [!NOTE]
-> **Prototype Status:** TraceRoot AI is currently in **Milestone 1** (initial prototype). All log data shown in the dashboard is **simulated demonstration data**. The platform does not yet connect to live applications, stream real-time logs, or execute autonomous AI root cause investigations.
+> **Prototype Status:** TraceRoot AI is currently in **Milestone 2** (Dynamic Event Simulation & Rolling Error-Spike Detection). All log data shown in the dashboard is **simulated demonstration data**. The platform does not yet connect to live applications, external log pipelines, or cloud production databases.
 
 ---
 
-## Current Features (Milestone 1)
+## Current Features
 
-- **Simulated Log Stream:** 24 realistic sample log records simulating request completions, authentication failures, database timeouts, HTTP 500 errors, and deployment events across 6 distinct microservices.
-- **Headline Summary Metrics:** Instant overview of total log count (24), ERROR count (7), WARNING count (7), and unique active services (6).
-- **Interactive Multi-Attribute Filters:** Filter the log view dynamically by log level (`INFO`, `WARNING`, `ERROR`) and service name via the sidebar.
-- **Log Records Explorer:** Tabular inspection of filtered records with timestamps, log levels, service identifiers, and message bodies.
-- **Severity Distribution Visualization:** Compact horizontal bar chart illustrating the proportion of INFO, WARNING, and ERROR records.
-- **Error Investigation Section:**
-  - Aggregated error counts grouped by producing service.
-  - Repeated error message tracking with occurrence frequency and first/last seen timestamps.
-  - Plain-language triage guidance to assist operators in prioritizing investigations.
-- **Rule-Based Anomaly Detection:**
-  - **Fixed Threshold Rule:** Flags any service logging 3 or more errors.
-  - **Statistical Outlier Rule:** Flags services with 2 or more errors whose error count exceeds the cohort average by more than 1 standard deviation (active when 3 or more services are selected).
-  - Assigns `High` or `Medium` priority with clear explanatory summaries.
-- **Defensive Error Handling:** Graceful fallback messaging and empty-state handling when filter selections return zero records.
+### 1. Dynamic Log Simulation (Milestone 2)
+- **Interactive Batch Generation:** Add batches of 5 realistic, timestamped events across 6 core microservices (`api-gateway`, `auth-service`, `order-service`, `payment-service`, `database-proxy`, `deployment-service`).
+- **Simulate Error Spike Scenario:** Inject concentrated error bursts (5 rapid errors in under 90 seconds) for any selected microservice to simulate active outages.
+- **Controlled Auto-Streaming:** Toggle continuous simulated event streaming (every 4 seconds) with controlled rate-limiting and one-click pause.
+- **Session State Persistence & Bounded Storage:** Retains simulated logs across filter adjustments in Streamlit session state, with a safe 500-record cap to prevent unbounded memory usage.
+- **One-Click Baseline Reset:** Instantly revert to the original 24-record baseline.
+
+### 2. Real-Time Rolling Error-Spike Detection (Milestone 2)
+- **Temporal Velocity Analysis:** Evaluates error rates within a configurable rolling window (e.g., last 10 minutes) rather than static historical totals.
+- **Dynamic Alerting:** Alerts trigger when error count meets or exceeds the threshold:
+  - **High:** Error count reaches threshold within window.
+  - **Critical:** Error count is at least double ($\ge 2\times$) the threshold.
+- **Configurable Parameters:** Adjust the rolling window (1–60 minutes) and error threshold (1–15 errors) dynamically in the sidebar.
+- **Anomaly Disclaimer:** Explicitly presents spikes as anomalous operational symptoms, avoiding premature root cause claims.
+
+### 3. Log Analytics & Visualization (Milestone 1 Baseline)
+- **Summary Metrics:** Dynamic counters for Total Records, ERRORs, WARNINGs, and Unique Services, with latest event timestamp.
+- **Multi-Attribute Filters:** Filter records simultaneously by severity (`INFO`, `WARNING`, `ERROR`) and service.
+- **Side-by-Side Explorer:** Synchronized tabular log explorer and horizontal severity distribution chart.
+- **Error Investigation Triage:** Detailed breakdowns of producing services, repeat message frequencies, and triage guidance.
+- **Cohort Anomaly Detection:** Statistical $\mu + 1\sigma$ and fixed-threshold rules across historical service totals.
 
 ---
 
@@ -98,7 +105,7 @@ Streamlit will launch a local web server (typically at `http://localhost:8501`) 
 
 ## Running Automated Tests
 
-TraceRoot AI includes an automated unit test suite covering pure analytical functions, summary counts, filtering logic, and anomaly detection rules.
+TraceRoot AI includes an automated unit test suite with **29 passing tests** covering analytical functions, dynamic event generation, bounded memory storage, and rolling spike detection.
 
 Run the tests using `pytest`:
 
@@ -116,16 +123,16 @@ pytest -v
 
 ## Current Architecture & Limitations
 
-- **Simulated In-Memory Data:** All 24 log records are hard-coded in Python tuple structures. Refreshing the dashboard resets the view to the initial state.
-- **Deterministic Heuristics:** Anomaly detection relies on simple counting thresholds and standard deviation cutoffs rather than machine learning or temporal spike analysis.
+- **Simulated In-Memory Data:** All records are generated in memory and tracked in Streamlit session state. Closing the browser tab resets the simulation to the 24-record baseline.
+- **Rule-Based Heuristics:** Spike detection relies on rolling time windows and count thresholds rather than AI / machine learning models.
 - **No External Services:** No database, external API, authentication layer, or cloud log stream integrations are connected in this milestone.
 
 ---
 
 ## Planned Future Milestones
 
-1. **Milestone 1:** Basic log monitoring dashboard with simulated data *(Current version)*
-2. **Milestone 2:** Time-series error spike detection and temporal anomaly correlation
+1. **Milestone 1:** Basic log monitoring dashboard with simulated data *(Completed)*
+2. **Milestone 2:** Dynamic simulated log generation and rolling time-window error-spike detection *(Completed)*
 3. **Milestone 3:** Evidence-based AI root cause analysis using LLM reasoning and pattern clustering
 4. **Milestone 4:** Incident timeline construction, severity scoring, and mitigation recommendations
 5. **Milestone 5:** Database integration (PostgreSQL / SQLite), Docker containerization, and CI/CD pipelines
