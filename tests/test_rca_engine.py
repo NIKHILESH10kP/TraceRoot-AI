@@ -8,6 +8,7 @@ All tests are pure, deterministic, and execute completely offline without extern
 import pandas as pd
 import pytest
 
+from privacy_sanitizer import prepare_ai_payload
 from rca_engine import (
     calculate_confidence_score,
     correlate_temporal_events,
@@ -374,4 +375,159 @@ def test_input_dataframe_remains_unchanged(db_exhaustion_logs: pd.DataFrame):
 
     # Verify identical structure and contents
     pd.testing.assert_frame_equal(db_exhaustion_logs, original_copy)
+
+
+# ---------------------------------------------------------------------------
+# Test 16: Adversarial Indirect Raw Log Leakage Prevention (Recognized Pattern)
+# ---------------------------------------------------------------------------
+def test_recognized_pattern_does_not_leak_raw_log_strings_into_rca_or_ai_payload():
+    """Verify sensitive customer PII, hostnames, SQL, and unique markers in logs are not leaked into RCA evidence or AI payload."""
+    sensitive_markers = [
+        "Customer_Jane_Doe_VIP",
+        "k8s-pod-db-prod-04.us-east.corp.internal",
+        "/var/secrets/vault/private_key.pem",
+        "SELECT * FROM payroll_records WHERE emp_ssn = '999-00-1111'",
+        "https://vault-internal.mesh.corp:8200/v1/auth/tokens?session_id=SECRET987",
+        "RAW_LEAK_TEST_7F91",
+    ]
+
+    records = [
+        (
+            "2026-10-27 10:00:00",
+            "ERROR",
+            "database-proxy",
+            "Database connection pool exhausted. Target host: k8s-pod-db-prod-04.us-east.corp.internal with path /var/secrets/vault/private_key.pem RAW_LEAK_TEST_7F91",
+        ),
+        (
+            "2026-10-27 10:00:15",
+            "ERROR",
+            "payment-service",
+            "Payment timeout during query SELECT * FROM payroll_records WHERE emp_ssn = '999-00-1111' for Customer_Jane_Doe_VIP",
+        ),
+        (
+            "2026-10-27 10:00:30",
+            "ERROR",
+            "api-gateway",
+            "HTTP 504 Gateway Timeout connecting to https://vault-internal.mesh.corp:8200/v1/auth/tokens?session_id=SECRET987",
+        ),
+    ]
+    df = pd.DataFrame(records, columns=["timestamp", "level", "service", "message"])
+
+    # 1. Run local rule-based RCA
+    rca_result = run_rule_based_rca(df)
+    assert rca_result["status"] == "completed"
+
+    # Verify pattern detection still succeeds
+    matched_patterns = [p for p in rca_result["patterns_detected"] if p["matched"]]
+    assert len(matched_patterns) == 1
+    assert matched_patterns[0]["pattern_name"] == "Database Exhaustion Cascade"
+
+    # Verify local records still exist in correlated_events for local dashboard SREs
+    assert "records" in rca_result["correlated_events"][0]
+    assert len(rca_result["correlated_events"][0]["records"]) == 3
+
+    # Check RCA evidence strings directly
+    for cause in rca_result["ranked_causes"]:
+        for marker in sensitive_markers:
+            assert marker not in cause["possible_root_cause"]
+            for ev in cause["evidence_supporting"]:
+                assert marker not in ev
+            for ev in cause["evidence_against"]:
+                assert marker not in ev
+            for step in cause["recommended_verification_steps"]:
+                assert marker not in step
+
+    for pat in rca_result["patterns_detected"]:
+        for marker in sensitive_markers:
+            assert marker not in pat["description"]
+            for ev in pat["evidence"]:
+                assert marker not in ev
+
+    for w in rca_result["warnings"]:
+        for marker in sensitive_markers:
+            assert marker not in w
+
+    # 2. Run prepare_ai_payload() for external AI transmission
+    ai_payload = prepare_ai_payload(rca_result)
+    assert ai_payload["validation_passed"] is True
+    assert ai_payload["sanitization_info"]["eligible_for_transmission"] is True
+
+    payload_str = str(ai_payload)
+    for marker in sensitive_markers:
+        assert marker not in payload_str, f"Marker '{marker}' leaked into AI payload!"
+
+
+# ---------------------------------------------------------------------------
+# Test 17: Adversarial Indirect Raw Log Leakage Prevention (Unrecognized Fallback)
+# ---------------------------------------------------------------------------
+def test_unrecognized_fallback_does_not_leak_raw_log_strings_into_rca_or_ai_payload():
+    """Verify fallback cause summaries and evidence do not echo uncurated error messages."""
+    sensitive_markers = [
+        "Customer_Jane_Doe_VIP",
+        "k8s-pod-db-prod-04.us-east.corp.internal",
+        "/var/secrets/vault/private_key.pem",
+        "SELECT * FROM payroll_records WHERE emp_ssn = '999-00-1111'",
+        "RAW_LEAK_TEST_7F91",
+    ]
+
+    records = [
+        (
+            "2026-10-27 12:00:00",
+            "ERROR",
+            "analytics-service",
+            "Arbitrary internal syntax error on /var/secrets/vault/private_key.pem for Customer_Jane_Doe_VIP "
+            "executing SELECT * FROM payroll_records WHERE emp_ssn = '999-00-1111' at k8s-pod-db-prod-04.us-east.corp.internal RAW_LEAK_TEST_7F91",
+        ),
+        (
+            "2026-10-27 12:00:10",
+            "ERROR",
+            "analytics-service",
+            "Arbitrary internal syntax error on /var/secrets/vault/private_key.pem for Customer_Jane_Doe_VIP "
+            "executing SELECT * FROM payroll_records WHERE emp_ssn = '999-00-1111' at k8s-pod-db-prod-04.us-east.corp.internal RAW_LEAK_TEST_7F91",
+        ),
+    ]
+    df = pd.DataFrame(records, columns=["timestamp", "level", "service", "message"])
+
+    rca_result = run_rule_based_rca(df)
+    assert rca_result["status"] == "completed"
+
+    # Verify fallback cause summary is fixed application template
+    top_cause = rca_result["ranked_causes"][0]
+    assert top_cause["possible_root_cause"] == "Localized application failure or exception surge within analytics-service."
+
+    # Check all fields in RCA result
+    for marker in sensitive_markers:
+        assert marker not in top_cause["possible_root_cause"]
+        for ev in top_cause["evidence_supporting"]:
+            assert marker not in ev
+        for ev in top_cause["evidence_against"]:
+            assert marker not in ev
+        for step in top_cause["recommended_verification_steps"]:
+            assert marker not in step
+
+    # Check prepare_ai_payload output
+    ai_payload = prepare_ai_payload(rca_result)
+    assert ai_payload["validation_passed"] is True
+
+    payload_str = str(ai_payload)
+    for marker in sensitive_markers:
+        assert marker not in payload_str, f"Marker '{marker}' leaked into fallback AI payload!"
+
+
+# ---------------------------------------------------------------------------
+# Test 18: Timestamp Normalization Warning Uses Fixed Safe Template
+# ---------------------------------------------------------------------------
+def test_timestamp_normalization_warning_uses_fixed_message_without_exception_leak():
+    """Verify timestamp normalization errors produce fixed warnings without raw exception strings."""
+    # Dataframe with unparseable timestamps
+    records = [
+        ("INVALID_TIMESTAMP_EXCEPTION_PROBE_7F91", "ERROR", "auth-service", "Error message"),
+    ]
+    df = pd.DataFrame(records, columns=["timestamp", "level", "service", "message"])
+
+    rca_result = run_rule_based_rca(df)
+    for w in rca_result["warnings"]:
+        assert "INVALID_TIMESTAMP_EXCEPTION_PROBE_7F91" not in w
+        assert "Traceback" not in w
+        assert "Exception" not in w
 

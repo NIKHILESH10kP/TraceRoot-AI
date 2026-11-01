@@ -15,6 +15,8 @@ Guarantees:
 
 import copy
 from datetime import date, datetime
+import json
+import math
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -349,6 +351,280 @@ def sanitize_data_structure(data: Any) -> Tuple[Any, Set[str]]:
         return data, detected_categories
 
 
+# ===========================================================================
+# Strict Schema Allowlist & Data Minimization Constants
+# ===========================================================================
+
+MAX_PAYLOAD_SIZE_BYTES = 64 * 1024  # 64 KB hard cap
+MAX_RANKED_CAUSES = 5
+MAX_INCIDENTS = 5
+MAX_PATTERNS = 5
+MAX_WARNINGS = 10
+MAX_RECORDS_PER_INCIDENT_CAP = 10
+DEFAULT_MAX_RECORDS_PER_INCIDENT = 5
+MAX_EVIDENCE_ITEMS = 10
+MAX_SERVICES_COUNT = 20
+MAX_TEXT_LENGTH = 500
+MAX_IDENTIFIER_LENGTH = 64
+MAX_TIMESTAMP_LENGTH = 35
+MAX_NESTING_DEPTH = 7
+
+ALLOWED_TOP_LEVEL_KEYS = {
+    "status",
+    "validation_passed",
+    "total_errors",
+    "incident_count",
+    "ranked_causes",
+    "correlated_events",
+    "patterns_detected",
+    "warnings",
+    "sanitization_info",
+}
+
+ALLOWED_CAUSE_KEYS = {
+    "candidate_service",
+    "possible_root_cause",
+    "confidence_score",
+    "confidence_level",
+    "confidence_breakdown",
+    "evidence_supporting",
+    "evidence_against",
+    "affected_services",
+    "first_observed_timestamp",
+    "recommended_verification_steps",
+    "patient_zero_candidate",
+    "classification",
+}
+
+ALLOWED_INCIDENT_KEYS = {
+    "incident_id",
+    "start_time",
+    "end_time",
+    "duration_seconds",
+    "primary_service",
+    "services",
+    "error_count",
+}
+
+# Note: Raw records, stack traces, and messages are completely excluded from AI payloads.
+# ALLOWED_RECORD_KEYS is retained for internal reference only.
+ALLOWED_RECORD_KEYS = {
+    "timestamp",
+    "service",
+    "level",
+    "message",
+}
+
+ALLOWED_PATTERN_KEYS = {
+    "pattern_name",
+    "matched",
+    "description",
+    "evidence",
+}
+
+# Strict Service Identifier regex: Starts with alphanumeric, followed by up to 63 chars of [A-Za-z0-9_.-]
+SERVICE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+# Strict Incident Identifier regex: Starts with alphanumeric, followed by up to 31 chars of [A-Za-z0-9_.-]
+INCIDENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
+
+
+def is_valid_service_identifier(service_name: Any) -> bool:
+    """Validate service identifier format against a strict alphanumeric allowlist.
+
+    Allowed format:
+    - Starts with an alphanumeric character [A-Za-z0-9]
+    - Followed by up to 63 characters consisting of [A-Za-z0-9_.-]
+    - Total length 1 to 64 characters
+    - Rejects whitespace, newlines, control characters, quotes, and prompt injection
+    """
+    if not isinstance(service_name, str) or isinstance(service_name, bool):
+        return False
+    if len(service_name) < 1 or len(service_name) > MAX_IDENTIFIER_LENGTH:
+        return False
+    return bool(SERVICE_IDENTIFIER_PATTERN.fullmatch(service_name))
+
+
+def is_valid_incident_id(val: Any) -> Tuple[bool, str]:
+    """Validate and normalize an incident identifier.
+
+    Accepts:
+    - Non-negative integers (e.g. 1, 2, 42) -> normalized to str (e.g. "1")
+    - Alphanumeric strings matching ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ (e.g. "INC-101", "inc_01")
+
+    Rejects:
+    - Booleans (True, False)
+    - Floats, None, lists, dicts, unexpected objects
+    - Strings with whitespace, newlines, tabs, quotes, control characters
+    - Prompt injection phrases (e.g. 'SYSTEM: OVERRIDE INSTRUCTIONS')
+    - Overlong strings (>32 chars) or empty strings
+
+    Returns:
+    - Tuple[bool, str]: (is_valid, normalized_incident_id_str)
+    """
+    if val is None or isinstance(val, bool):
+        return False, ""
+
+    if isinstance(val, int):
+        if val < 0 or val > 999_999_999:
+            return False, ""
+        return True, str(val)
+
+    if isinstance(val, str):
+        if not val or len(val) > 32 or len(val) < 1:
+            return False, ""
+        if not INCIDENT_ID_PATTERN.fullmatch(val):
+            return False, ""
+        return True, val
+
+    return False, ""
+
+
+def validate_and_normalize_timestamp(val: Any) -> Tuple[bool, str]:
+    """Validate and normalize a timestamp to standard ISO-8601 format.
+
+    Accepts:
+    - Valid ISO-8601 strings (e.g., '2026-10-27T10:15:30', '2026-10-27 10:15:30',
+      '2026-10-27T10:15:30Z', '2026-10-27T10:15:30.123456+00:00', '2026-10-27')
+    - Python datetime or date objects (including pandas Timestamps)
+
+    Rejects:
+    - Arbitrary text or prompt injection attempts
+    - Malformed dates (e.g. '2026-02-31', 'invalid-date')
+    - Control characters, tabs, newlines, or strings exceeding 35 characters
+    - Leading or trailing whitespace
+    - Non-string / non-datetime types (bool, int, float, list, dict, None)
+    - NaT (Not-a-Time) objects or strings
+
+    Returns:
+    - Tuple[bool, str]: (is_valid, normalized_iso_string)
+    """
+    if val is None or isinstance(val, bool):
+        return False, ""
+
+    # Check for pandas/numpy NaT or string "NaT"
+    str_val = str(val)
+    if str_val == "NaT" or "NaT" in str_val:
+        return False, ""
+
+    if isinstance(val, datetime):
+        try:
+            return True, val.isoformat()
+        except Exception:
+            return False, ""
+
+    if isinstance(val, date):
+        try:
+            return True, val.isoformat()
+        except Exception:
+            return False, ""
+
+    if isinstance(val, str):
+        if not val or len(val) > MAX_TIMESTAMP_LENGTH or len(val) < 8:
+            return False, ""
+        if val != val.strip():
+            return False, ""
+        if any(ord(c) < 32 or ord(c) == 127 for c in val):
+            return False, ""
+
+        try:
+            dt = datetime.fromisoformat(val)
+            return True, dt.isoformat()
+        except Exception:
+            return False, ""
+
+    return False, ""
+
+
+def _check_nesting_depth(data: Any, current_depth: int = 1, visited: Optional[Set[int]] = None) -> bool:
+    """Verify that structure depth does not exceed MAX_NESTING_DEPTH and has no cycles."""
+    if visited is None:
+        visited = set()
+
+    if current_depth > MAX_NESTING_DEPTH:
+        return False
+
+    obj_id = id(data)
+    if isinstance(data, (dict, list, tuple, set, frozenset)):
+        if obj_id in visited:
+            return False  # Circular reference detected
+        visited.add(obj_id)
+
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if not _check_nesting_depth(v, current_depth + 1, visited):
+                return False
+    elif isinstance(data, (list, tuple, set, frozenset)):
+        for item in data:
+            if not _check_nesting_depth(item, current_depth + 1, visited):
+                return False
+
+    if isinstance(data, (dict, list, tuple, set, frozenset)):
+        visited.remove(obj_id)
+
+    return True
+
+
+def _make_rejection_payload(reason: str, original_warnings: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Construct a standardized, fail-closed rejection payload.
+
+    Security guarantees:
+    - Never echoes unredacted raw input; applies sanitize_text() to reason and warnings.
+    - Limits string lengths to 200 characters and warnings count to MAX_WARNINGS.
+    - Explicitly sets is_sanitized=False and eligible_for_transmission=False.
+    - Prefers fixed error codes/messages instead of interpolating arbitrary input.
+    """
+    clean_reason = sanitize_text(str(reason))[:200]
+    warnings: List[str] = []
+    if original_warnings and isinstance(original_warnings, list):
+        for w in original_warnings[:MAX_WARNINGS]:
+            if isinstance(w, str):
+                warnings.append(sanitize_text(w)[:200])
+            else:
+                warnings.append(sanitize_text(str(w))[:200])
+
+    formatted_msg = f"Payload validation failed: {clean_reason}"
+    if len(warnings) < MAX_WARNINGS:
+        warnings.append(formatted_msg)
+    elif warnings:
+        warnings[-1] = formatted_msg
+
+    return {
+        "status": "rejected",
+        "validation_passed": False,
+        "rejection_reason": clean_reason,
+        "total_errors": 0,
+        "incident_count": 0,
+        "ranked_causes": [],
+        "correlated_events": [],
+        "patterns_detected": [],
+        "warnings": warnings,
+        "sanitization_info": {
+            "is_sanitized": False,
+            "eligible_for_transmission": False,
+            "redacted_categories": [],
+            "status": "validation_rejected",
+        },
+    }
+
+
+def _clean_str(val: Any, max_len: int, categories: Set[str]) -> str:
+    """Convert to string, truncate to max_len, sanitize, and record categories."""
+    if val is None:
+        return ""
+    if isinstance(val, (datetime, date)):
+        str_val = str(val) if str(val) == "NaT" else val.isoformat()
+    else:
+        str_val = str(val)
+
+    if len(str_val) > max_len:
+        str_val = str_val[:max_len]
+
+    sanitized, cats = sanitize_data_structure(str_val)
+    categories.update(cats)
+    return sanitized
+
+
 def sanitize_rca_result(rca_result: Any) -> Dict[str, Any]:
     """Sanitize complete structured findings returned by `run_rule_based_rca()`.
 
@@ -356,6 +632,7 @@ def sanitize_rca_result(rca_result: Any) -> Dict[str, Any]:
     - Never modifies the input `rca_result` (uses deep copy).
     - Returns a safe, fully sanitized dictionary structure.
     - Handles None, empty dicts, or malformed inputs without exceptions.
+    - Invalid inputs fail closed with is_sanitized=False.
     - Adds `sanitization_info` metadata describing what categories were redacted.
 
     Parameters
@@ -378,22 +655,42 @@ def sanitize_rca_result(rca_result: Any) -> Dict[str, Any]:
             "patterns_detected": [],
             "warnings": ["Input to privacy sanitizer was not a valid dictionary."],
             "sanitization_info": {
-                "is_sanitized": True,
+                "is_sanitized": False,
+                "eligible_for_transmission": False,
                 "redacted_categories": [],
-                "status": "skipped_invalid_input",
+                "status": "rejected_invalid_input",
             },
         }
 
     # Deep copy ensures zero mutation of caller's data
-    data_copy = copy.deepcopy(rca_result)
+    try:
+        data_copy = copy.deepcopy(rca_result)
+    except Exception:
+        return {
+            "status": "invalid_input",
+            "total_errors": 0,
+            "incident_count": 0,
+            "ranked_causes": [],
+            "correlated_events": [],
+            "patterns_detected": [],
+            "warnings": ["Input structure could not be safely duplicated."],
+            "sanitization_info": {
+                "is_sanitized": False,
+                "eligible_for_transmission": False,
+                "redacted_categories": [],
+                "status": "rejected_invalid_input",
+            },
+        }
 
     sanitized_data, categories = sanitize_data_structure(data_copy)
 
     # Attach sanitization audit metadata
     sanitized_data["sanitization_info"] = {
         "is_sanitized": True,
+        "eligible_for_transmission": sanitized_data.get("status") == "completed",
         "redacted_categories": sorted(list(categories)),
         "redactions_applied": len(categories) > 0,
+        "status": "sanitized",
     }
 
     return sanitized_data
@@ -405,33 +702,329 @@ def prepare_ai_payload(
 ) -> Dict[str, Any]:
     """Prepare a compact, sanitized summary payload tailored for external AI prompts.
 
-    Guarantees that every string in the payload has been passed through the sanitization
-    pipeline. Also caps the number of individual log records per incident to prevent
-    prompt token bloat and stay comfortably within free-tier rate and token limits.
+    Guarantees:
+    - Strict schema allowlisting: only explicitly approved keys and types survive.
+    - Completely excludes raw log records, messages, stack traces, and headers.
+    - Preserves high-level incident metadata (timestamps, duration, services, error count).
+    - Drops raw DataFrames, uploaded file contents, session state, and unknown fields.
+    - Deep copy of input ensures zero mutation of caller's RCA result; guarded against exceptions.
+    - Enforces recursion depth and bounds to prevent denial-of-service.
+    - Sanitizes all string fields through the credential and PII redaction engine.
+    - Strictly validates all numeric fields against NaN, Infinity, and type violations (RFC 8259 JSON).
+    - Never reflects untrusted user input into rejection reasons or warnings.
+    - Enforces strict list limits and a 64 KB total serialized payload size limit.
+    - Fails closed on invalid or malformed inputs (never marks invalid inputs as sanitized).
 
     Parameters
     ----------
     rca_result : Any
         Structured RCA result dictionary.
     max_records_per_incident : int, optional
-        Maximum individual log records to include per incident cluster (default: 5).
+        Deprecated; raw records are excluded from external transmission payloads.
 
     Returns
     -------
     Dict[str, Any]
-        Compact, privacy-safe dictionary ready to be converted into an LLM prompt.
+        Compact, privacy-safe, allowlisted dictionary ready for AI prompt conversion.
     """
-    sanitized_rca = sanitize_rca_result(rca_result)
+    # 1. Type validation: Input must be a dictionary
+    if rca_result is None or not isinstance(rca_result, dict):
+        return _make_rejection_payload("Input must be a valid dictionary")
 
-    # Compact the correlated_events records to prevent prompt bloat
-    if "correlated_events" in sanitized_rca and isinstance(sanitized_rca["correlated_events"], list):
-        for incident in sanitized_rca["correlated_events"]:
-            if isinstance(incident, dict) and "records" in incident:
-                records = incident["records"]
-                if isinstance(records, list):
-                    if len(records) > max_records_per_incident:
-                        incident["records"] = records[:max_records_per_incident]
-                        incident["records_truncated"] = True
-                        incident["total_records_in_incident"] = len(records)
+    # 2. Immutability & Defensive Copying: Deep copy before any processing
+    try:
+        input_copy = copy.deepcopy(rca_result)
+    except Exception:
+        return _make_rejection_payload("Input structure could not be duplicated")
 
-    return sanitized_rca
+    orig_warnings = input_copy.get("warnings") if isinstance(input_copy.get("warnings"), list) else None
+
+    # 3. Recursion & depth defense
+    if not _check_nesting_depth(input_copy):
+        return _make_rejection_payload(
+            "Input structure exceeds maximum nesting depth or contains cyclical references",
+            orig_warnings,
+        )
+
+    # 4. Strict status check: Must be 'completed' (fixed safe message, no input reflection)
+    status = input_copy.get("status")
+    if status != "completed":
+        return _make_rejection_payload("Field 'status' must be 'completed'", orig_warnings)
+
+    # 5. Numerical integrity
+    total_errors = input_copy.get("total_errors")
+    incident_count = input_copy.get("incident_count")
+    if not isinstance(total_errors, int) or isinstance(total_errors, bool) or total_errors < 0:
+        return _make_rejection_payload("Field 'total_errors' must be a non-negative integer", orig_warnings)
+    if not isinstance(incident_count, int) or isinstance(incident_count, bool) or incident_count < 0:
+        return _make_rejection_payload("Field 'incident_count' must be a non-negative integer", orig_warnings)
+
+    categories: Set[str] = set()
+
+    # 6. Filter and construct 'ranked_causes' (allowlist & finite numeric enforcement)
+    raw_causes = input_copy.get("ranked_causes", [])
+    if not isinstance(raw_causes, list):
+        return _make_rejection_payload("Field 'ranked_causes' must be a list", orig_warnings)
+
+    for cause in raw_causes:
+        if isinstance(cause, dict):
+            raw_cand = cause.get("candidate_service")
+            if not is_valid_service_identifier(raw_cand):
+                return _make_rejection_payload("Field 'candidate_service' contains an invalid service identifier", orig_warnings)
+
+            raw_affected = cause.get("affected_services", [])
+            if raw_affected is not None and not isinstance(raw_affected, list):
+                return _make_rejection_payload("Field 'affected_services' must be a list", orig_warnings)
+            if isinstance(raw_affected, list):
+                for svc in raw_affected:
+                    if not is_valid_service_identifier(svc):
+                        return _make_rejection_payload("Field 'affected_services' contains an invalid service identifier", orig_warnings)
+
+            if "first_observed_timestamp" in cause:
+                raw_first_ts = cause["first_observed_timestamp"]
+                is_valid_ts, _ = validate_and_normalize_timestamp(raw_first_ts)
+                if not is_valid_ts:
+                    return _make_rejection_payload("Field 'first_observed_timestamp' contains an invalid timestamp", orig_warnings)
+
+    clean_causes: List[Dict[str, Any]] = []
+    for cause in raw_causes[:MAX_RANKED_CAUSES]:
+        if not isinstance(cause, dict):
+            continue
+
+        cand_svc = _clean_str(cause.get("candidate_service", ""), MAX_IDENTIFIER_LENGTH, categories)
+        possible_cause = _clean_str(cause.get("possible_root_cause", ""), MAX_TEXT_LENGTH, categories)
+
+        if "confidence_score" in cause:
+            raw_score = cause["confidence_score"]
+            if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)) or math.isnan(raw_score) or math.isinf(raw_score):
+                return _make_rejection_payload("Field 'confidence_score' must be a finite number between 0 and 100", orig_warnings)
+            conf_score = float(raw_score)
+            if conf_score < 0.0 or conf_score > 100.0:
+                return _make_rejection_payload("Field 'confidence_score' must be between 0 and 100", orig_warnings)
+        else:
+            conf_score = 0.0
+
+        conf_level = _clean_str(cause.get("confidence_level", "Unknown"), 32, categories)
+
+        raw_breakdown = cause.get("confidence_breakdown", {})
+        clean_breakdown: Dict[str, Any] = {}
+        if isinstance(raw_breakdown, dict):
+            for bk, bv in raw_breakdown.items():
+                if isinstance(bk, str):
+                    if isinstance(bv, bool) or (isinstance(bv, (int, float)) and (math.isnan(bv) or math.isinf(bv))):
+                        return _make_rejection_payload("Values in 'confidence_breakdown' must be finite numbers", orig_warnings)
+                    if isinstance(bv, (int, float)):
+                        clean_breakdown[_clean_str(bk, 32, categories)] = float(bv)
+                    elif isinstance(bv, dict):
+                        clean_sub: Dict[str, Any] = {}
+                        for sub_k, sub_v in bv.items():
+                            if isinstance(sub_k, str):
+                                if isinstance(sub_v, bool) or (isinstance(sub_v, (int, float)) and (math.isnan(sub_v) or math.isinf(sub_v))):
+                                    return _make_rejection_payload("Values in 'confidence_breakdown' must be finite numbers", orig_warnings)
+                                if isinstance(sub_v, (int, float)):
+                                    clean_sub[_clean_str(sub_k, 32, categories)] = float(sub_v)
+                                elif isinstance(sub_v, str):
+                                    clean_sub[_clean_str(sub_k, 32, categories)] = _clean_str(sub_v, 100, categories)
+                        clean_breakdown[_clean_str(bk, 32, categories)] = clean_sub
+                    elif isinstance(bv, str):
+                        clean_breakdown[_clean_str(bk, 32, categories)] = _clean_str(bv, 100, categories)
+
+        raw_ev_supp = cause.get("evidence_supporting", [])
+        clean_ev_supp: List[str] = []
+        if isinstance(raw_ev_supp, list):
+            for item in raw_ev_supp[:MAX_EVIDENCE_ITEMS]:
+                clean_ev_supp.append(_clean_str(item, MAX_TEXT_LENGTH, categories))
+
+        raw_ev_against = cause.get("evidence_against", [])
+        clean_ev_against: List[str] = []
+        if isinstance(raw_ev_against, list):
+            for item in raw_ev_against[:MAX_EVIDENCE_ITEMS]:
+                clean_ev_against.append(_clean_str(item, MAX_TEXT_LENGTH, categories))
+
+        raw_affected = cause.get("affected_services", [])
+        clean_affected: List[str] = []
+        if isinstance(raw_affected, list):
+            for svc in raw_affected[:MAX_SERVICES_COUNT]:
+                clean_affected.append(_clean_str(svc, MAX_IDENTIFIER_LENGTH, categories))
+
+        raw_steps = cause.get("recommended_verification_steps", [])
+        clean_steps: List[str] = []
+        if isinstance(raw_steps, list):
+            for step in raw_steps[:MAX_EVIDENCE_ITEMS]:
+                clean_steps.append(_clean_str(step, MAX_TEXT_LENGTH, categories))
+
+        clean_first_ts = ""
+        if "first_observed_timestamp" in cause:
+            _, norm_first_ts = validate_and_normalize_timestamp(cause["first_observed_timestamp"])
+            clean_first_ts = norm_first_ts
+
+        clean_causes.append({
+            "candidate_service": cand_svc,
+            "possible_root_cause": possible_cause,
+            "confidence_score": conf_score,
+            "confidence_level": conf_level,
+            "confidence_breakdown": clean_breakdown,
+            "evidence_supporting": clean_ev_supp,
+            "evidence_against": clean_ev_against,
+            "affected_services": clean_affected,
+            "first_observed_timestamp": clean_first_ts,
+            "recommended_verification_steps": clean_steps,
+            "patient_zero_candidate": bool(cause.get("patient_zero_candidate", False)),
+            "classification": _clean_str(cause.get("classification", "Hypothesis"), 64, categories),
+        })
+
+    # 7. Filter and construct 'correlated_events' (raw records completely omitted)
+    raw_events = input_copy.get("correlated_events", [])
+    if not isinstance(raw_events, list):
+        return _make_rejection_payload("Field 'correlated_events' must be a list", orig_warnings)
+
+    for event in raw_events:
+        if isinstance(event, dict):
+            # Validate incident_id
+            raw_inc_id = event.get("incident_id")
+            is_valid_id, _ = is_valid_incident_id(raw_inc_id)
+            if not is_valid_id:
+                return _make_rejection_payload("Field 'incident_id' contains an invalid incident identifier", orig_warnings)
+
+            raw_svcs = event.get("services", [])
+            if raw_svcs is not None and not isinstance(raw_svcs, list):
+                return _make_rejection_payload("Field 'services' must be a list", orig_warnings)
+            if isinstance(raw_svcs, list):
+                for s in raw_svcs:
+                    if not is_valid_service_identifier(s):
+                        return _make_rejection_payload("Field 'services' contains an invalid service identifier", orig_warnings)
+
+            has_start = "start_time" in event
+            norm_start_ts = ""
+            if has_start:
+                raw_start = event["start_time"]
+                is_valid_ts, norm_start_ts = validate_and_normalize_timestamp(raw_start)
+                if not is_valid_ts:
+                    return _make_rejection_payload("Field 'start_time' contains an invalid timestamp", orig_warnings)
+
+            has_end = "end_time" in event
+            norm_end_ts = ""
+            if has_end:
+                raw_end = event["end_time"]
+                is_valid_ts, norm_end_ts = validate_and_normalize_timestamp(raw_end)
+                if not is_valid_ts:
+                    return _make_rejection_payload("Field 'end_time' contains an invalid timestamp", orig_warnings)
+
+            # Temporal consistency validation: end_time must not precede start_time
+            if has_start and has_end and norm_start_ts and norm_end_ts:
+                try:
+                    dt_start = datetime.fromisoformat(norm_start_ts)
+                    dt_end = datetime.fromisoformat(norm_end_ts)
+                    if (dt_start.tzinfo is None) != (dt_end.tzinfo is None):
+                        return _make_rejection_payload("Field 'end_time' must not precede start_time", orig_warnings)
+                    if dt_end < dt_start:
+                        return _make_rejection_payload("Field 'end_time' must not precede start_time", orig_warnings)
+                except Exception:
+                    return _make_rejection_payload("Field 'end_time' must not precede start_time", orig_warnings)
+
+    clean_events: List[Dict[str, Any]] = []
+    for event in raw_events[:MAX_INCIDENTS]:
+        if not isinstance(event, dict):
+            continue
+
+        raw_svcs = event.get("services", [])
+        clean_svcs: List[str] = []
+        if isinstance(raw_svcs, list):
+            for s in raw_svcs[:MAX_SERVICES_COUNT]:
+                clean_svcs.append(_clean_str(s, MAX_IDENTIFIER_LENGTH, categories))
+
+        dur_raw = event.get("duration_seconds", 0.0)
+        if isinstance(dur_raw, bool) or not isinstance(dur_raw, (int, float)) or math.isnan(dur_raw) or math.isinf(dur_raw):
+            return _make_rejection_payload("Field 'duration_seconds' must be a finite number", orig_warnings)
+        dur = float(dur_raw)
+        if dur < 0.0:
+            return _make_rejection_payload("Field 'duration_seconds' must be non-negative", orig_warnings)
+
+        raw_err_cnt = event.get("error_count")
+        if raw_err_cnt is not None:
+            if isinstance(raw_err_cnt, bool) or not isinstance(raw_err_cnt, int) or raw_err_cnt < 0:
+                return _make_rejection_payload("Field 'error_count' must be a non-negative integer", orig_warnings)
+            clean_err_count = raw_err_cnt
+        else:
+            raw_records = event.get("records")
+            clean_err_count = len(raw_records) if isinstance(raw_records, list) else 0
+
+        clean_start_ts = ""
+        if "start_time" in event:
+            _, norm_start_ts = validate_and_normalize_timestamp(event["start_time"])
+            clean_start_ts = norm_start_ts
+
+        clean_end_ts = ""
+        if "end_time" in event:
+            _, norm_end_ts = validate_and_normalize_timestamp(event["end_time"])
+            clean_end_ts = norm_end_ts
+
+        _, clean_inc_id = is_valid_incident_id(event.get("incident_id"))
+
+        clean_ev = {
+            "incident_id": clean_inc_id,
+            "start_time": clean_start_ts,
+            "end_time": clean_end_ts,
+            "duration_seconds": dur,
+            "services": clean_svcs,
+            "error_count": clean_err_count,
+        }
+        clean_events.append(clean_ev)
+
+    # 8. Filter and construct 'patterns_detected' (allowlist enforcement)
+    raw_patterns = input_copy.get("patterns_detected", [])
+    clean_patterns: List[Dict[str, Any]] = []
+    if isinstance(raw_patterns, list):
+        for pat in raw_patterns[:MAX_PATTERNS]:
+            if isinstance(pat, dict):
+                raw_p_ev = pat.get("evidence", [])
+                clean_p_ev: List[str] = []
+                if isinstance(raw_p_ev, list):
+                    for pev in raw_p_ev[:MAX_EVIDENCE_ITEMS]:
+                        clean_p_ev.append(_clean_str(pev, MAX_TEXT_LENGTH, categories))
+                clean_patterns.append({
+                    "pattern_name": _clean_str(pat.get("pattern_name", ""), MAX_IDENTIFIER_LENGTH, categories),
+                    "matched": bool(pat.get("matched", False)),
+                    "description": _clean_str(pat.get("description", ""), MAX_TEXT_LENGTH, categories),
+                    "evidence": clean_p_ev,
+                })
+    elif raw_patterns is not None:
+        return _make_rejection_payload("Field 'patterns_detected' must be a list", orig_warnings)
+
+    # 9. Filter and construct 'warnings' (allowlist enforcement)
+    raw_warnings = input_copy.get("warnings", [])
+    clean_warnings: List[str] = []
+    if isinstance(raw_warnings, list):
+        for w in raw_warnings[:MAX_WARNINGS]:
+            clean_warnings.append(_clean_str(w, 200, categories))
+    elif raw_warnings is not None:
+        return _make_rejection_payload("Field 'warnings' must be a list", orig_warnings)
+
+    # 10. Assemble the restricted, allowlisted dictionary
+    allowed_payload = {
+        "status": "completed",
+        "validation_passed": True,
+        "total_errors": total_errors,
+        "incident_count": incident_count,
+        "ranked_causes": clean_causes,
+        "correlated_events": clean_events,
+        "patterns_detected": clean_patterns,
+        "warnings": clean_warnings,
+        "sanitization_info": {
+            "is_sanitized": True,
+            "eligible_for_transmission": True,
+            "redacted_categories": sorted(list(categories)),
+            "redactions_applied": len(categories) > 0,
+            "status": "validated_and_sanitized",
+        },
+    }
+
+    # 11. Size limit and JSON compliance enforcement (RFC 8259, no NaN/Infinity)
+    try:
+        serialized = json.dumps(allowed_payload, allow_nan=False)
+        if len(serialized.encode("utf-8")) > MAX_PAYLOAD_SIZE_BYTES:
+            return _make_rejection_payload("Payload serialized size exceeds limit", orig_warnings)
+    except Exception:
+        return _make_rejection_payload("Payload JSON serialization failed", orig_warnings)
+
+    return allowed_payload

@@ -53,8 +53,8 @@ def _validate_and_prepare_logs(logs_df: Any) -> Tuple[Optional[pd.DataFrame], Li
         # Strip timezone if present to ensure uniform comparisons
         if hasattr(clean_df["timestamp"].dt, "tz") and clean_df["timestamp"].dt.tz is not None:
             clean_df["timestamp"] = clean_df["timestamp"].dt.tz_localize(None)
-    except Exception as err:
-        warnings.append(f"Error normalizing timestamps: {err}")
+    except Exception:
+        warnings.append("Timestamp normalization encountered invalid input; affected records were excluded.")
 
     # Check for NaT timestamps
     invalid_ts_count = int(clean_df["timestamp"].isna().sum())
@@ -237,7 +237,7 @@ def detect_known_failure_patterns(
         if not db_errors.empty:
             earliest_db = db_errors["timestamp"].min()
             db_pattern["evidence"].append(
-                f"Database proxy error observed at {earliest_db}: '{db_errors.iloc[0]['message']}'"
+                f"Database proxy connection or pool exhaustion error observed at {earliest_db} ({len(db_errors)} error record(s))."
             )
         else:
             db_pattern["missing_evidence"].append("No database-proxy connection or pool errors found in logs.")
@@ -245,8 +245,7 @@ def detect_known_failure_patterns(
         if not downstream_errors.empty:
             earliest_downstream = downstream_errors["timestamp"].min()
             db_pattern["evidence"].append(
-                f"Downstream service '{downstream_errors.iloc[0]['service']}' failed at {earliest_downstream}: "
-                f"'{downstream_errors.iloc[0]['message']}'"
+                f"Downstream service '{downstream_errors.iloc[0]['service']}' database query/timeout failure observed at {earliest_downstream} ({len(downstream_errors)} error record(s))."
             )
         else:
             db_pattern["missing_evidence"].append(
@@ -256,7 +255,7 @@ def detect_known_failure_patterns(
         if not gateway_errors.empty:
             earliest_gw = gateway_errors["timestamp"].min()
             db_pattern["evidence"].append(
-                f"API gateway failure at {earliest_gw}: '{gateway_errors.iloc[0]['message']}'"
+                f"API gateway HTTP 5xx failure observed at {earliest_gw} ({len(gateway_errors)} error record(s))."
             )
         else:
             db_pattern["missing_evidence"].append("No upstream API gateway 500/504 errors found.")
@@ -319,9 +318,8 @@ def detect_known_failure_patterns(
         if not deploy_records.empty:
             deploy_ev = deploy_records.iloc[-1]
             deploy_ts = deploy_ev["timestamp"]
-            deploy_msg = deploy_ev["message"]
             deploy_pattern["evidence"].append(
-                f"Deployment event detected at {deploy_ts}: '{deploy_msg}' ({deploy_ev['service']})"
+                f"Deployment lifecycle event detected at {deploy_ts} in service '{deploy_ev['service']}'."
             )
 
             # Look for subsequent application errors occurring within 300 seconds (5 mins) after deployment
@@ -388,7 +386,7 @@ def detect_known_failure_patterns(
         if not auth_errors.empty:
             earliest_auth = auth_errors["timestamp"].min()
             auth_pattern["evidence"].append(
-                f"Auth service error observed at {earliest_auth}: '{auth_errors.iloc[0]['message']}'"
+                f"Authentication service token/credential verification failure observed at {earliest_auth} ({len(auth_errors)} error record(s))."
             )
         else:
             auth_pattern["missing_evidence"].append("No auth-service authentication errors found.")
@@ -396,7 +394,7 @@ def detect_known_failure_patterns(
         if not upstream_auth_errors.empty:
             earliest_upstream = upstream_auth_errors["timestamp"].min()
             auth_pattern["evidence"].append(
-                f"Dependent service '{upstream_auth_errors.iloc[0]['service']}' logged auth-related failure at {earliest_upstream}"
+                f"Dependent service '{upstream_auth_errors.iloc[0]['service']}' logged auth-related failure at {earliest_upstream} ({len(upstream_auth_errors)} error record(s))."
             )
         else:
             auth_pattern["missing_evidence"].append("No upstream/dependent services logged cascading auth errors.")
@@ -495,7 +493,7 @@ def identify_patient_zero(errors_df: pd.DataFrame) -> Dict[str, Any]:
         )
 
     explanation = (
-        f"Service '{candidate_service}' logged the earliest error at {first_seen}: \"{first_message}\". "
+        f"Service '{candidate_service}' logged the earliest error at {first_seen}. "
         "In distributed architectures, upstream component failures often precede downstream cascading symptoms."
     )
 
@@ -802,7 +800,7 @@ def run_rule_based_rca(logs_df: Any) -> Dict[str, Any]:
         # Compile supporting evidence
         evidence_supporting = [
             f"Logged {cand_error_count} error record(s) during the evaluated period.",
-            f"First observed failure at {first_cand_ts}: \"{top_message}\".",
+            f"First observed failure at {first_cand_ts} in service '{candidate}'.",
         ]
         if is_pz:
             evidence_supporting.append(
@@ -884,7 +882,7 @@ def _generate_cause_summary(
     elif "deployment" in lower_msg or "rollback" in lower_msg:
         return f"Recent deployment rollout or configuration regression initiated by {service}."
     else:
-        return f"Localized application failure or exception surge within {service} ({top_message})."
+        return f"Localized application failure or exception surge within {service}."
 
 
 def _generate_troubleshooting_steps(
