@@ -3,18 +3,23 @@
 These tests verify pure functions without requiring a running Streamlit server.
 """
 
+import hashlib
+from unittest import mock
 import pandas as pd
 import pytest
+import streamlit as st
 
 from app import (
     ANOMALY_COLUMNS,
     LOG_LEVELS,
     MAX_UPLOAD_RECORDS,
+    MAX_UPLOAD_SIZE_BYTES,
     SERVICES,
     SPIKE_COLUMNS,
     append_and_cap_logs,
     calculate_statistical_cutoff,
     calculate_summary,
+    compute_uploaded_file_hash,
     count_by_severity,
     count_errors_per_service,
     detect_error_anomalies,
@@ -27,6 +32,10 @@ from app import (
     parse_jsonl_text,
     parse_log_text,
     parse_uploaded_log_file,
+    reset_uploaded_file_state,
+    should_reparse_uploaded_file,
+    show_data_source_controls,
+    show_error_spike_section,
     summarize_error_messages,
     summarize_errors_by_service,
 )
@@ -714,3 +723,493 @@ def test_parse_log_text_capping_limit():
     assert len(df) == MAX_UPLOAD_RECORDS  # 5000
     assert summary["capped"] is True
     assert summary["valid_records"] == MAX_UPLOAD_RECORDS
+
+
+# ---------------------------------------------------------------------------
+# Milestone 5 - Task 5.1: Same-Filename File Re-Upload Hardening Tests
+# ---------------------------------------------------------------------------
+def test_compute_uploaded_file_hash_deterministic():
+    """Verify compute_uploaded_file_hash produces deterministic SHA-256 for bytes and text."""
+    raw_bytes = b"2026-10-29 10:00:00 INFO api User login\n"
+    expected_hex = hashlib.sha256(raw_bytes).hexdigest()
+
+    # From bytes
+    assert compute_uploaded_file_hash(raw_bytes) == expected_hex
+    # From string
+    assert compute_uploaded_file_hash(raw_bytes.decode("utf-8")) == expected_hex
+    # Minor content change produces different hash
+    modified_bytes = b"2026-10-29 10:00:01 INFO api User login\n"
+    assert compute_uploaded_file_hash(modified_bytes) != expected_hex
+
+    # Invalid type raises TypeError
+    with pytest.raises(TypeError, match="Expected bytes or str"):
+        compute_uploaded_file_hash(12345)
+
+
+def test_reparse_needed_on_first_upload(sample_logs: pd.DataFrame):
+    """Verify first upload triggers parsing when no previously processed dataset exists."""
+    assert should_reparse_uploaded_file(
+        uploaded_df=None,
+        last_filename=None,
+        current_filename="production.log",
+        last_hash=None,
+        current_hash="hash_v1",
+    ) is True
+
+    # Even if last_filename happened to be set, None uploaded_df must re-parse
+    assert should_reparse_uploaded_file(
+        uploaded_df=None,
+        last_filename="production.log",
+        current_filename="production.log",
+        last_hash="hash_v1",
+        current_hash="hash_v1",
+    ) is True
+
+
+def test_reparse_triggered_on_same_filename_modified_content(sample_logs: pd.DataFrame):
+    """Verify same filename with modified content hash triggers re-parsing."""
+    hash_v1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    hash_v2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+    assert should_reparse_uploaded_file(
+        uploaded_df=sample_logs,
+        last_filename="service.log",
+        current_filename="service.log",
+        last_hash=hash_v1,
+        current_hash=hash_v2,
+    ) is True
+
+
+def test_reparse_skipped_on_same_filename_identical_content(sample_logs: pd.DataFrame):
+    """Verify same filename with identical content does not trigger unnecessary re-parsing."""
+    hash_v1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+    assert should_reparse_uploaded_file(
+        uploaded_df=sample_logs,
+        last_filename="service.log",
+        current_filename="service.log",
+        last_hash=hash_v1,
+        current_hash=hash_v1,
+    ) is False
+
+
+def test_reparse_triggered_on_different_filename(sample_logs: pd.DataFrame):
+    """Verify changing the filename triggers parsing even if content hash is identical or different."""
+    hash_v1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    hash_v2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+    # Different filename, same hash
+    assert should_reparse_uploaded_file(
+        uploaded_df=sample_logs,
+        last_filename="old_service.log",
+        current_filename="new_service.log",
+        last_hash=hash_v1,
+        current_hash=hash_v1,
+    ) is True
+
+    # Different filename, different hash
+    assert should_reparse_uploaded_file(
+        uploaded_df=sample_logs,
+        last_filename="old_service.log",
+        current_filename="new_service.log",
+        last_hash=hash_v1,
+        current_hash=hash_v2,
+    ) is True
+
+
+def test_clearing_uploaded_file_resets_metadata_and_enables_reparsing(sample_logs: pd.DataFrame):
+    """Verify reset_uploaded_file_state clears all 4 upload session state keys."""
+    mock_state = {
+        "uploaded_logs_df": sample_logs,
+        "uploaded_file_summary": {"valid_records": 24},
+        "uploaded_file_name": "app.log",
+        "uploaded_file_hash": "hash_xyz",
+    }
+
+    reset_uploaded_file_state(mock_state)
+
+    assert mock_state["uploaded_logs_df"] is None
+    assert mock_state["uploaded_file_summary"] is None
+    assert mock_state["uploaded_file_name"] is None
+    assert mock_state["uploaded_file_hash"] is None
+
+    # After clearing, re-uploading the exact same file must reparse
+    assert should_reparse_uploaded_file(
+        uploaded_df=mock_state["uploaded_logs_df"],
+        last_filename=mock_state["uploaded_file_name"],
+        current_filename="app.log",
+        last_hash=mock_state["uploaded_file_hash"],
+        current_hash="hash_xyz",
+    ) is True
+
+
+def test_invalid_upload_does_not_mark_hash_as_processed():
+    """Verify that an invalid or failed upload does not record its hash as successfully processed."""
+    mock_session_state = {
+        "data_source_mode": "uploaded",
+        "uploaded_logs_df": None,
+        "uploaded_file_summary": None,
+        "uploaded_file_name": None,
+        "uploaded_file_hash": None,
+    }
+
+    # Simulate an uploaded file object whose size exceeds the limit
+    oversized_file = mock.MagicMock()
+    oversized_file.name = "huge.log"
+    oversized_file.size = MAX_UPLOAD_SIZE_BYTES + 1024
+    oversized_file.getvalue.return_value = b"some oversized content"
+
+    with mock.patch.object(st, "session_state", mock_session_state, create=True), \
+         mock.patch("streamlit.sidebar.radio", return_value="Uploaded Log File"), \
+         mock.patch("streamlit.sidebar.file_uploader", return_value=oversized_file), \
+         mock.patch("streamlit.sidebar.error") as mock_error, \
+         mock.patch("streamlit.sidebar.markdown"), \
+         mock.patch("streamlit.sidebar.subheader"), \
+         mock.patch("streamlit.sidebar.header"):
+        mode = show_data_source_controls()
+        assert mode == "uploaded"
+        mock_error.assert_called_once()
+        assert "File too large!" in mock_error.call_args[0][0]
+        # Hash must NOT be set to the oversized file's hash
+        assert mock_session_state["uploaded_file_hash"] is None
+        assert mock_session_state["uploaded_logs_df"] is None
+
+
+def test_show_data_source_controls_same_filename_reupload_flow():
+    """Verify integrated flow: same filename with modified content triggers re-parsing."""
+    content_v1 = b"2026-10-29 10:00:00 INFO api Request 1\n"
+    content_v2 = (
+        b"2026-10-29 10:00:00 INFO api Request 1\n"
+        b"2026-10-29 10:01:00 ERROR api Request 2 failed\n"
+    )
+
+    mock_session_state = {
+        "data_source_mode": "uploaded",
+        "uploaded_logs_df": None,
+        "uploaded_file_summary": None,
+        "uploaded_file_name": None,
+        "uploaded_file_hash": None,
+    }
+
+    file_v1 = mock.MagicMock()
+    file_v1.name = "service.log"
+    file_v1.size = len(content_v1)
+    file_v1.getvalue.return_value = content_v1
+
+    # 1. First upload of service.log
+    with mock.patch.object(st, "session_state", mock_session_state, create=True), \
+         mock.patch("streamlit.sidebar.radio", return_value="Uploaded Log File"), \
+         mock.patch("streamlit.sidebar.file_uploader", return_value=file_v1), \
+         mock.patch("streamlit.sidebar.markdown"), \
+         mock.patch("streamlit.sidebar.subheader"), \
+         mock.patch("streamlit.sidebar.header"), \
+         mock.patch("streamlit.sidebar.button", return_value=False):
+        show_data_source_controls()
+
+    assert mock_session_state["uploaded_file_name"] == "service.log"
+    assert mock_session_state["uploaded_logs_df"] is not None
+    assert len(mock_session_state["uploaded_logs_df"]) == 1
+    expected_hash_v1 = hashlib.sha256(content_v1).hexdigest()
+    assert mock_session_state["uploaded_file_hash"] == expected_hash_v1
+
+    # 2. Second run: exact same file content & name -> does not re-parse
+    with mock.patch.object(st, "session_state", mock_session_state, create=True), \
+         mock.patch("streamlit.sidebar.radio", return_value="Uploaded Log File"), \
+         mock.patch("streamlit.sidebar.file_uploader", return_value=file_v1), \
+         mock.patch("streamlit.sidebar.markdown"), \
+         mock.patch("streamlit.sidebar.subheader"), \
+         mock.patch("streamlit.sidebar.header"), \
+         mock.patch("streamlit.sidebar.button", return_value=False), \
+         mock.patch("app.parse_uploaded_log_file") as mock_parse:
+        show_data_source_controls()
+        mock_parse.assert_not_called()
+
+    # 3. Third run: same filename "service.log" with updated content_v2 -> triggers re-parsing
+    file_v2 = mock.MagicMock()
+    file_v2.name = "service.log"
+    file_v2.size = len(content_v2)
+    file_v2.getvalue.return_value = content_v2
+
+    with mock.patch.object(st, "session_state", mock_session_state, create=True), \
+         mock.patch("streamlit.sidebar.radio", return_value="Uploaded Log File"), \
+         mock.patch("streamlit.sidebar.file_uploader", return_value=file_v2), \
+         mock.patch("streamlit.sidebar.markdown"), \
+         mock.patch("streamlit.sidebar.subheader"), \
+         mock.patch("streamlit.sidebar.header"), \
+         mock.patch("streamlit.sidebar.button", return_value=False):
+        show_data_source_controls()
+
+    assert mock_session_state["uploaded_file_name"] == "service.log"
+    assert len(mock_session_state["uploaded_logs_df"]) == 2
+    expected_hash_v2 = hashlib.sha256(content_v2).hexdigest()
+    assert mock_session_state["uploaded_file_hash"] == expected_hash_v2
+    assert expected_hash_v2 != expected_hash_v1
+
+    # 4. Clear button clicked -> resets state
+    with mock.patch.object(st, "session_state", mock_session_state, create=True), \
+         mock.patch("streamlit.sidebar.radio", return_value="Uploaded Log File"), \
+         mock.patch("streamlit.sidebar.file_uploader", return_value=None), \
+         mock.patch("streamlit.sidebar.markdown"), \
+         mock.patch("streamlit.sidebar.subheader"), \
+         mock.patch("streamlit.sidebar.header"), \
+         mock.patch("streamlit.sidebar.button", return_value=True), \
+         mock.patch("streamlit.rerun") as mock_rerun:
+        show_data_source_controls()
+        mock_rerun.assert_called_once()
+
+    assert mock_session_state["uploaded_logs_df"] is None
+    assert mock_session_state["uploaded_file_name"] is None
+    assert mock_session_state["uploaded_file_hash"] is None
+    assert mock_session_state["uploaded_file_summary"] is None
+
+
+def test_show_data_source_controls_parsing_exception_resets_hash():
+    """Verify that if parse_uploaded_log_file raises an unexpected exception, state is cleared."""
+    mock_session_state = {
+        "data_source_mode": "uploaded",
+        "uploaded_logs_df": None,
+        "uploaded_file_summary": None,
+        "uploaded_file_name": None,
+        "uploaded_file_hash": "stale_hash",
+    }
+
+    bad_file = mock.MagicMock()
+    bad_file.name = "corrupt.log"
+    bad_file.size = 100
+    bad_file.getvalue.return_value = b"corrupt binary bytes"
+
+    with mock.patch.object(st, "session_state", mock_session_state, create=True), \
+         mock.patch("streamlit.sidebar.radio", return_value="Uploaded Log File"), \
+         mock.patch("streamlit.sidebar.file_uploader", return_value=bad_file), \
+         mock.patch("streamlit.sidebar.markdown"), \
+         mock.patch("streamlit.sidebar.subheader"), \
+         mock.patch("streamlit.sidebar.header"), \
+         mock.patch("streamlit.sidebar.button", return_value=False), \
+         mock.patch("streamlit.sidebar.error") as mock_error, \
+         mock.patch("app.parse_uploaded_log_file", side_effect=RuntimeError("Parsing crashed")):
+        show_data_source_controls()
+        mock_error.assert_called_once()
+        assert "Parsing crashed" in mock_error.call_args[0][0]
+        # All 4 keys must be reset to None atomically
+        assert mock_session_state["uploaded_logs_df"] is None
+        assert mock_session_state["uploaded_file_summary"] is None
+        assert mock_session_state["uploaded_file_name"] is None
+        assert mock_session_state["uploaded_file_hash"] is None
+
+
+def test_oversized_replacement_upload_clears_all_state_and_dataset(sample_logs: pd.DataFrame):
+    """Verify that an oversized replacement upload resets all 4 session keys and clears old data (TR-AUD-05)."""
+    # Active valid dataset from prior upload
+    mock_session_state = {
+        "data_source_mode": "uploaded",
+        "uploaded_logs_df": sample_logs.copy(),
+        "uploaded_file_summary": {"valid_records": 24, "total_lines": 24, "rejected_records": 0, "blank_lines": 0},
+        "uploaded_file_name": "previous_valid.log",
+        "uploaded_file_hash": "previous_valid_hash_12345",
+    }
+
+    # User attempts to replace with an oversized file
+    oversized_file = mock.MagicMock()
+    oversized_file.name = "oversized_replacement.log"
+    oversized_file.size = MAX_UPLOAD_SIZE_BYTES + 4096
+    oversized_file.getvalue.return_value = b"oversized content"
+
+    with mock.patch.object(st, "session_state", mock_session_state, create=True), \
+         mock.patch("streamlit.sidebar.radio", return_value="Uploaded Log File"), \
+         mock.patch("streamlit.sidebar.file_uploader", return_value=oversized_file), \
+         mock.patch("streamlit.sidebar.markdown"), \
+         mock.patch("streamlit.sidebar.subheader"), \
+         mock.patch("streamlit.sidebar.header"), \
+         mock.patch("streamlit.sidebar.button", return_value=False), \
+         mock.patch("streamlit.sidebar.error") as mock_error:
+        mode = show_data_source_controls()
+        assert mode == "uploaded"
+        mock_error.assert_called_once()
+        assert "File too large!" in mock_error.call_args[0][0]
+
+    # All four session keys must be atomically cleared (no stale dataset or split-brain metadata)
+    assert mock_session_state["uploaded_logs_df"] is None
+    assert mock_session_state["uploaded_file_summary"] is None
+    assert mock_session_state["uploaded_file_name"] is None
+    assert mock_session_state["uploaded_file_hash"] is None
+
+
+def test_parsing_exception_replacement_clears_all_state_and_dataset(sample_logs: pd.DataFrame):
+    """Verify that a replacement upload encountering a parse exception resets all 4 session keys (TR-AUD-05)."""
+    # Active valid dataset from prior upload
+    mock_session_state = {
+        "data_source_mode": "uploaded",
+        "uploaded_logs_df": sample_logs.copy(),
+        "uploaded_file_summary": {"valid_records": 24},
+        "uploaded_file_name": "previous_valid.log",
+        "uploaded_file_hash": "previous_valid_hash_12345",
+    }
+
+    # User attempts to upload corrupt file
+    corrupt_content = b"corrupt binary bytes that crash parser"
+    bad_file = mock.MagicMock()
+    bad_file.name = "corrupt_replacement.log"
+    bad_file.size = len(corrupt_content)
+    bad_file.getvalue.return_value = corrupt_content
+
+    with mock.patch.object(st, "session_state", mock_session_state, create=True), \
+         mock.patch("streamlit.sidebar.radio", return_value="Uploaded Log File"), \
+         mock.patch("streamlit.sidebar.file_uploader", return_value=bad_file), \
+         mock.patch("streamlit.sidebar.markdown"), \
+         mock.patch("streamlit.sidebar.subheader"), \
+         mock.patch("streamlit.sidebar.header"), \
+         mock.patch("streamlit.sidebar.button", return_value=False), \
+         mock.patch("streamlit.sidebar.error") as mock_error, \
+         mock.patch("app.parse_uploaded_log_file", side_effect=RuntimeError("Decoder crash on corrupted tokens")):
+        mode = show_data_source_controls()
+        assert mode == "uploaded"
+        mock_error.assert_called_once()
+        assert "Decoder crash on corrupted tokens" in mock_error.call_args[0][0]
+
+    # All four session keys must be reset to None
+    assert mock_session_state["uploaded_logs_df"] is None
+    assert mock_session_state["uploaded_file_summary"] is None
+    assert mock_session_state["uploaded_file_name"] is None
+    assert mock_session_state["uploaded_file_hash"] is None
+
+
+def test_subsequent_valid_upload_recovers_after_failed_replacement(sample_logs: pd.DataFrame):
+    """Verify that a subsequent valid upload works cleanly after an upload failure (TR-AUD-05)."""
+    # Start with active valid upload
+    mock_session_state = {
+        "data_source_mode": "uploaded",
+        "uploaded_logs_df": sample_logs.copy(),
+        "uploaded_file_summary": {"valid_records": 24},
+        "uploaded_file_name": "initial.log",
+        "uploaded_file_hash": "initial_hash",
+    }
+
+    # Step 1: Failed replacement upload (oversized)
+    bad_file = mock.MagicMock()
+    bad_file.name = "oversized.log"
+    bad_file.size = MAX_UPLOAD_SIZE_BYTES + 100
+    bad_file.getvalue.return_value = b"oversized"
+
+    with mock.patch.object(st, "session_state", mock_session_state, create=True), \
+         mock.patch("streamlit.sidebar.radio", return_value="Uploaded Log File"), \
+         mock.patch("streamlit.sidebar.file_uploader", return_value=bad_file), \
+         mock.patch("streamlit.sidebar.markdown"), \
+         mock.patch("streamlit.sidebar.subheader"), \
+         mock.patch("streamlit.sidebar.header"), \
+         mock.patch("streamlit.sidebar.button", return_value=False), \
+         mock.patch("streamlit.sidebar.error"):
+        show_data_source_controls()
+
+    # Confirmed cleared
+    assert mock_session_state["uploaded_logs_df"] is None
+
+    # Step 2: User fixes the issue and uploads a new valid file
+    valid_content = b"2026-10-29 10:00:00 INFO api Healthy recovery event\n"
+    good_file = mock.MagicMock()
+    good_file.name = "recovered.log"
+    good_file.size = len(valid_content)
+    good_file.getvalue.return_value = valid_content
+
+    with mock.patch.object(st, "session_state", mock_session_state, create=True), \
+         mock.patch("streamlit.sidebar.radio", return_value="Uploaded Log File"), \
+         mock.patch("streamlit.sidebar.file_uploader", return_value=good_file), \
+         mock.patch("streamlit.sidebar.markdown"), \
+         mock.patch("streamlit.sidebar.subheader"), \
+         mock.patch("streamlit.sidebar.header"), \
+         mock.patch("streamlit.sidebar.button", return_value=False):
+        show_data_source_controls()
+
+    # Successfully ingested
+    assert mock_session_state["uploaded_file_name"] == "recovered.log"
+    assert mock_session_state["uploaded_logs_df"] is not None
+    assert len(mock_session_state["uploaded_logs_df"]) == 1
+    assert mock_session_state["uploaded_file_summary"]["valid_records"] == 1
+    expected_hash = hashlib.sha256(valid_content).hexdigest()
+    assert mock_session_state["uploaded_file_hash"] == expected_hash
+
+
+# ---------------------------------------------------------------------------
+# Milestone 5 - Task 5.2.2: Operational Spike Detection & Filter Alignment Tests
+# ---------------------------------------------------------------------------
+def test_show_error_spike_section_detects_spike_when_error_deselected_in_filters():
+    """Verify operational spike detection alerts on active_logs even when ERROR is filtered out (TR-E2E-02)."""
+    base_time = pd.Timestamp("2026-10-29 12:00:00")
+    # 5 rapid ERROR records for payment-service within 5 minutes
+    spike_records = [
+        {"timestamp": base_time + pd.Timedelta(minutes=i), "level": "ERROR", "service": "payment-service", "message": f"Timeout {i}"}
+        for i in range(5)
+    ]
+    # Plus normal INFO records
+    info_records = [
+        {"timestamp": base_time + pd.Timedelta(minutes=i), "level": "INFO", "service": "auth-service", "message": "Login ok"}
+        for i in range(3)
+    ]
+    active_logs = pd.DataFrame(spike_records + info_records).sort_values("timestamp").reset_index(drop=True)
+
+    # Operator deselects ERROR in visual sidebar filters: filtered_logs contains only INFO
+    filtered_logs = filter_logs(active_logs, selected_levels=["INFO"], selected_services=["auth-service", "payment-service"])
+    assert (filtered_logs["level"] == "ERROR").sum() == 0
+
+    # Operational spike detection receives active_logs
+    with mock.patch("streamlit.header"), \
+         mock.patch("streamlit.caption"), \
+         mock.patch("streamlit.expander"), \
+         mock.patch("streamlit.markdown"), \
+         mock.patch("streamlit.dataframe") as mock_df, \
+         mock.patch("streamlit.error") as mock_error, \
+         mock.patch("streamlit.success") as mock_success:
+        show_error_spike_section(active_logs, window_minutes=10, error_threshold=3)
+
+        # Operational alert must trigger
+        mock_error.assert_called_once()
+        assert "1 Service Error Spike(s) Detected!" in mock_error.call_args[0][0]
+        # Success banner must NOT be displayed
+        mock_success.assert_not_called()
+        # Dataframe rendered in alert must contain payment-service
+        rendered_df = mock_df.call_args[0][0]
+        assert len(rendered_df) == 1
+        assert rendered_df.iloc[0]["service"] == "payment-service"
+        assert rendered_df.iloc[0]["error_count"] == 5
+
+
+def test_show_error_spike_section_empty_dataset_renders_info_no_healthy_claim(empty_logs: pd.DataFrame):
+    """Verify empty dataset displays informational message and does not claim services are healthy."""
+    with mock.patch("streamlit.header"), \
+         mock.patch("streamlit.caption"), \
+         mock.patch("streamlit.expander"), \
+         mock.patch("streamlit.markdown"), \
+         mock.patch("streamlit.info") as mock_info, \
+         mock.patch("streamlit.success") as mock_success, \
+         mock.patch("streamlit.error") as mock_error:
+        show_error_spike_section(empty_logs, window_minutes=10, error_threshold=3)
+
+        mock_info.assert_called_once()
+        assert "No log records available" in mock_info.call_args[0][0]
+        # Must not display success or make false healthy claims
+        mock_success.assert_not_called()
+        mock_error.assert_not_called()
+
+
+def test_show_error_spike_section_non_empty_no_spikes_accurate_messaging(sample_logs: pd.DataFrame):
+    """Verify non-empty dataset with zero spikes shows success without claiming normal health."""
+    with mock.patch("streamlit.header"), \
+         mock.patch("streamlit.caption"), \
+         mock.patch("streamlit.expander"), \
+         mock.patch("streamlit.markdown"), \
+         mock.patch("streamlit.info") as mock_info, \
+         mock.patch("streamlit.success") as mock_success, \
+         mock.patch("streamlit.error") as mock_error:
+        show_error_spike_section(sample_logs, window_minutes=10, error_threshold=3)
+
+        mock_info.assert_not_called()
+        mock_error.assert_not_called()
+        mock_success.assert_called_once()
+        success_msg = mock_success.call_args[0][0]
+        assert "No error spikes detected" in success_msg
+        assert "active log dataset" in success_msg
+        # Must not claim all services are healthy or operating normally
+        assert "All services operating within expected rates" not in success_msg
+        assert "operating normally" not in success_msg.lower()
+        assert "healthy" not in success_msg.lower()
+
+

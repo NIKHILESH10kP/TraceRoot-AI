@@ -10,12 +10,20 @@ Run with:
     python -m streamlit run app.py
 """
 
+import copy
+import datetime
+import hashlib
 import json
+import math
 import random
 import re
 import time
+from typing import Any, Dict, Optional, Union
+import numpy as np
 import pandas as pd
 import streamlit as st
+
+from rca_engine import run_rule_based_rca
 
 # The three log levels used throughout the app, in order of increasing severity.
 LOG_LEVELS = ["INFO", "WARNING", "ERROR"]
@@ -592,6 +600,57 @@ def parse_uploaded_log_file(content: str, filename: str = "") -> tuple[pd.DataFr
     return parse_log_text(content)
 
 
+def compute_uploaded_file_hash(content: Any) -> str:
+    """Compute deterministic SHA-256 hex digest of file bytes or string content."""
+    if isinstance(content, str):
+        content_bytes = content.encode("utf-8")
+    elif isinstance(content, (bytes, bytearray, memoryview)):
+        content_bytes = bytes(content)
+    else:
+        raise TypeError(f"Expected bytes or str for file content hashing, got {type(content).__name__}")
+    return hashlib.sha256(content_bytes).hexdigest()
+
+
+def should_reparse_uploaded_file(
+    uploaded_df: Optional[pd.DataFrame],
+    last_filename: Optional[str],
+    current_filename: str,
+    last_hash: Optional[str],
+    current_hash: str,
+) -> bool:
+    """Determine whether an uploaded file needs to be parsed or re-parsed.
+
+    Re-parsing is required if:
+    - No previously parsed dataset exists (uploaded_df is None).
+    - The filename has changed.
+    - The content hash has changed, even if the filename is identical.
+    """
+    if uploaded_df is None:
+        return True
+    if last_filename != current_filename:
+        return True
+    if last_hash != current_hash:
+        return True
+    return False
+
+
+def reset_uploaded_file_state(session_state: Optional[Any] = None) -> None:
+    """Reset all session state metadata associated with uploaded log files."""
+    if session_state is not None:
+        state = session_state
+    else:
+        try:
+            state = st.session_state
+        except Exception:
+            state = None
+    if state is not None:
+        state["uploaded_logs_df"] = None
+        state["uploaded_file_summary"] = None
+        state["uploaded_file_name"] = None
+        state["uploaded_file_hash"] = None
+
+
+
 # ---------------------------------------------------------------------------
 # Data processing & analytics (pure functions, easily testable)
 # ---------------------------------------------------------------------------
@@ -814,6 +873,467 @@ def detect_rolling_error_spikes(
 
 
 # ---------------------------------------------------------------------------
+# Milestone 4: Deterministic RCA Execution & Caching Helpers
+# ---------------------------------------------------------------------------
+MAX_RCA_CACHE_ENTRIES = 32
+MAX_SERIALIZATION_DEPTH = 20
+
+
+def _canonical_serialize_value(val: Any, depth: int = 0) -> bytes:
+    """Deterministically serialize a scalar or collection value to unambiguous canonical bytes.
+
+    Encodes explicit type tags and length prefixes to prevent delimiter collisions:
+    - None: b'N;'
+    - bool / np.bool_: b'B:1;' or b'B:0;'
+    - int / np.integer: b'I:<value>;'
+    - float / np.floating: b'F:<nan|inf|-inf|formatted>;'
+    - str: b'S:<byte_length>:<utf8_bytes>;'
+    - bytes: b'X:<byte_length>:<raw_bytes>;'
+    - Timestamp / date / datetime: b'T:<iso_length>:<iso_string>;'
+    - list / tuple: b'L:<count>:[<elem1><elem2>...];'
+    - dict: b'D:<count>:{<sorted_k1><v1><sorted_k2><v2>...};' (keys sorted by canonical serialization)
+    - set / frozenset: b'Set:<count>:{<sorted_elem1><sorted_elem2>...};'
+
+    Raises ValueError if maximum nesting depth is exceeded or if an object cannot
+    be deterministically serialized without relying on memory addresses.
+    """
+    if depth > MAX_SERIALIZATION_DEPTH:
+        raise ValueError("Maximum nesting depth exceeded or cyclic container detected in dataset")
+
+    if val is None:
+        return b"N;"
+    if isinstance(val, (bool, np.bool_)):
+        return b"B:1;" if bool(val) else b"B:0;"
+    if isinstance(val, (int, np.integer)):
+        return f"I:{int(val)};".encode("utf-8")
+    if isinstance(val, (float, np.floating)):
+        fval = float(val)
+        if math.isnan(fval):
+            return b"F:nan;"
+        if math.isinf(fval):
+            return b"F:inf;" if fval > 0 else b"F:-inf;"
+        return f"F:{fval:.17g};".encode("utf-8")
+    if isinstance(val, str):
+        b = val.encode("utf-8", errors="replace")
+        return f"S:{len(b)}:".encode("utf-8") + b + b";"
+    if isinstance(val, bytes):
+        return f"X:{len(val)}:".encode("utf-8") + val + b";"
+    if isinstance(val, (pd.Timestamp, datetime.datetime, datetime.date)):
+        iso_b = val.isoformat().encode("utf-8")
+        return f"T:{len(iso_b)}:".encode("utf-8") + iso_b + b";"
+    if isinstance(val, (list, tuple)):
+        items = b"".join(_canonical_serialize_value(x, depth + 1) for x in val)
+        return f"L:{len(val)}:[".encode("utf-8") + items + b"];"
+    if isinstance(val, dict):
+        sorted_keys = sorted(val.keys(), key=lambda k: _canonical_serialize_value(k, depth + 1))
+        items = b"".join(
+            _canonical_serialize_value(k, depth + 1) + _canonical_serialize_value(val[k], depth + 1)
+            for k in sorted_keys
+        )
+        return f"D:{len(val)}:{{".encode("utf-8") + items + b"};"
+    if isinstance(val, (set, frozenset)):
+        sorted_items = sorted([_canonical_serialize_value(x, depth + 1) for x in val])
+        return f"Set:{len(val)}:{{".encode("utf-8") + b"".join(sorted_items) + b"};"
+
+    raise ValueError(f"Value of type '{type(val).__name__}' cannot be deterministically serialized")
+
+
+def compute_dataset_fingerprint(logs_df: Any, mode: str = "simulated") -> str:
+    """Compute a deterministic, content-and-order-sensitive fingerprint for a dataset.
+
+    Accounts for:
+    - Data source mode ('simulated' vs 'uploaded')
+    - Schema (column names and dtypes in exact sequence)
+    - Row count
+    - Content of every record (timestamp, level, service, message)
+    - Chronological / row order of records
+
+    Invalid or empty inputs produce distinct, predictable fingerprints.
+    """
+    clean_mode = str(mode).strip().lower() if mode else "unknown"
+    if not isinstance(logs_df, pd.DataFrame):
+        return f"invalid:{type(logs_df).__name__}:{clean_mode}"
+
+    hasher = hashlib.sha256()
+    hasher.update(clean_mode.encode("utf-8"))
+    hasher.update(b"|")
+
+    # Capture column names and data types in exact sequence
+    schema_str = ";".join(f"{str(col)}:{str(dtype)}" for col, dtype in zip(logs_df.columns, logs_df.dtypes))
+    hasher.update(schema_str.encode("utf-8"))
+    hasher.update(b"|")
+
+    # Capture row count
+    hasher.update(str(len(logs_df)).encode("utf-8"))
+    hasher.update(b"|")
+
+    # Capture cell contents and row sequence
+    if not logs_df.empty:
+        try:
+            content_bytes = pd.util.hash_pandas_object(logs_df, index=False).values.tobytes()
+            hasher.update(content_bytes)
+        except Exception:
+            # Fallback for unhashable Python objects (e.g., lists, dicts)
+            # Uses unambiguous canonical serialization to avoid delimiter collisions
+            for _, row in logs_df.iterrows():
+                row_bytes = b"".join(_canonical_serialize_value(val) for val in row.values)
+                hasher.update(f"R:{len(row_bytes)}:".encode("utf-8") + row_bytes)
+
+    return hasher.hexdigest()
+
+
+def get_or_compute_rca(
+    logs_df: Any,
+    mode: str = "simulated",
+    cache: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Execute rule-based RCA with deterministic caching across Streamlit reruns.
+
+    Parameters
+    ----------
+    logs_df : Any
+        Active logs DataFrame containing 'timestamp', 'level', 'service', 'message'.
+    mode : str, optional
+        Data source mode ('simulated' or 'uploaded'). Default is 'simulated'.
+    cache : Optional[Dict[str, Any]], optional
+        External cache dictionary. If None, checks Streamlit session_state['rca_cache']
+        if running within an active Streamlit runtime, or falls back to an ephemeral
+        local dictionary for standalone non-Streamlit execution.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Standardized RCA results dictionary with 'status', 'total_errors', 'incident_count',
+        'ranked_causes', 'correlated_events', 'patterns_detected', 'warnings', plus
+        'data_source_mode' and 'fingerprint'.
+    """
+    # Resolve target cache store:
+    # 1. Explicit caller cache takes highest priority
+    # 2. In active Streamlit runtime, use/lazily initialize st.session_state['rca_cache']
+    # 3. Otherwise (standalone / headless execution), use an ephemeral dictionary
+    target_cache: Dict[str, Any]
+    if cache is not None and isinstance(cache, dict):
+        target_cache = cache
+    else:
+        found_st_cache = False
+        try:
+            from streamlit.runtime import exists
+            if exists() and hasattr(st, "session_state"):
+                if "rca_cache" not in st.session_state:
+                    st.session_state["rca_cache"] = {}
+                target_cache = st.session_state["rca_cache"]
+                found_st_cache = True
+        except Exception:
+            found_st_cache = False
+
+        if not found_st_cache:
+            target_cache = {}
+
+    try:
+        fingerprint = compute_dataset_fingerprint(logs_df, mode=mode)
+    except Exception:
+        # Failsafe if fingerprinting raises (e.g. non-deterministic unhashable value)
+        return {
+            "status": "error",
+            "total_errors": 0,
+            "incident_count": 0,
+            "ranked_causes": [],
+            "correlated_events": [],
+            "patterns_detected": [],
+            "warnings": ["RCA analysis could not be completed due to an internal processing error."],
+            "data_source_mode": mode,
+            "fingerprint": f"invalid:error:{mode}",
+        }
+
+    # Cache hit: return a deep defensive copy
+    if fingerprint in target_cache:
+        return copy.deepcopy(target_cache[fingerprint])
+
+    # Defensive RCA engine execution: prevent unhandled exceptions from crashing dashboard
+    try:
+        raw_result = run_rule_based_rca(logs_df)
+    except Exception:
+        return {
+            "status": "error",
+            "total_errors": 0,
+            "incident_count": 0,
+            "ranked_causes": [],
+            "correlated_events": [],
+            "patterns_detected": [],
+            "warnings": ["RCA analysis could not be completed due to an internal processing error."],
+            "data_source_mode": mode,
+            "fingerprint": fingerprint,
+        }
+
+    result = copy.deepcopy(raw_result)
+    result["data_source_mode"] = mode
+    result["fingerprint"] = fingerprint
+
+    # Manage cache capacity to prevent unbounded memory growth
+    if len(target_cache) >= MAX_RCA_CACHE_ENTRIES:
+        oldest_key = next(iter(target_cache.keys()))
+        target_cache.pop(oldest_key, None)
+
+    target_cache[fingerprint] = copy.deepcopy(result)
+    return result
+
+
+def clear_rca_cache(cache: Optional[Dict[str, Any]] = None) -> None:
+    """Clear cached RCA results in provided cache dictionary and session state if present."""
+    if cache is not None and isinstance(cache, dict):
+        cache.clear()
+
+    try:
+        if hasattr(st, "session_state") and "rca_cache" in st.session_state:
+            st.session_state["rca_cache"].clear()
+    except Exception:
+        pass
+
+
+def _safe_int(val: Any, default: int = 0) -> int:
+    """Parse an integer safely, rejecting None, booleans, non-finite floats, and malformed inputs."""
+    if val is None or isinstance(val, (bool, np.bool_)):
+        return default
+    try:
+        if isinstance(val, (float, np.floating)):
+            if not math.isfinite(val):
+                return default
+        return int(val)
+    except (ValueError, TypeError, OverflowError):
+        return default
+
+
+def _safe_float(val: Any, default: Optional[float] = 0.0) -> Optional[float]:
+    """Parse a float safely, rejecting None, booleans, non-finite values (NaN, Inf), and malformed inputs."""
+    if val is None or isinstance(val, (bool, np.bool_)):
+        return default
+    try:
+        res = float(val)
+        if not math.isfinite(res):
+            return default
+        return res
+    except (ValueError, TypeError, OverflowError):
+        return default
+
+
+def show_root_cause_analysis_section(active_logs: pd.DataFrame, mode: str = "simulated") -> None:
+    """Render the automated rule-based Root Cause Analysis (RCA) dashboard section (Milestone 4).
+
+    Evaluates the complete active dataset (independent of sidebar visual filters) to capture
+    cross-service dependencies and deployment markers.
+    """
+    st.markdown("---")
+    st.header("🔍 Automated Root Cause Analysis (Deterministic Rule-Based)")
+    st.caption(
+        "Milestone 4 — Analyzes cross-service temporal clusters, patient-zero error chronology, "
+        "and architectural failure patterns across the complete active dataset."
+    )
+
+    rca_result = get_or_compute_rca(active_logs, mode=mode)
+    status = rca_result.get("status", "error")
+
+    # Status State 1: Analysis Error
+    if status == "error":
+        st.error(
+            "🚨 **Root Cause Analysis Error:** RCA analysis could not be completed due to an internal processing error. "
+            "Telemetry records remain accessible in the explorer below."
+        )
+        with st.expander("⚠️ View Error Details & System Warnings"):
+            warnings = rca_result.get("warnings", [])
+            if warnings:
+                for w in warnings:
+                    st.caption(f"- {w}")
+            else:
+                st.caption("- RCA analysis could not be completed due to an internal processing error.")
+        return
+
+    # Status State 2: Invalid Input
+    if status == "invalid_input":
+        st.warning(
+            "⚠️ **Invalid Log Dataset:** The active dataset cannot be analyzed because it is either not a valid DataFrame "
+            "or is missing required log schema columns ('timestamp', 'level', 'service', 'message')."
+        )
+        with st.expander("⚠️ View Validation Diagnostics"):
+            for w in rca_result.get("warnings", []):
+                st.caption(f"- {w}")
+        return
+
+    total_errors = _safe_int(rca_result.get("total_errors"), default=0)
+    incident_count = _safe_int(rca_result.get("incident_count"), default=0)
+
+    ranked_causes = rca_result.get("ranked_causes") or []
+    correlated_events = rca_result.get("correlated_events") or []
+    patterns = rca_result.get("patterns_detected") or []
+    matched_patterns = [p for p in patterns if isinstance(p, dict) and p.get("matched", False)]
+
+    # A. RCA Overview Metrics
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Analysis Status", "Completed" if incident_count > 0 else "No Incidents")
+    col2.metric("Errors Analyzed", total_errors)
+    col3.metric("Incident Clusters", incident_count)
+    col4.metric("Ranked Hypotheses", len(ranked_causes))
+    col5.metric("Matched Patterns", len(matched_patterns))
+
+    # Status State 3: Completed with 0 Incidents
+    if total_errors == 0 or incident_count == 0:
+        st.success(
+            "🟢 **No Failure Incidents Detected.** No multi-service failure cascades or correlated incident clusters "
+            "were detected in the active log dataset."
+        )
+        if rca_result.get("warnings"):
+            with st.expander("ℹ️ Observability Notes"):
+                for w in rca_result["warnings"]:
+                    st.caption(f"- {w}")
+        return
+
+    # Status State 4: Completed with Detected Incidents
+    st.info(
+        "ℹ️ **Heuristic Hypotheses Notice:** The root causes presented below are algorithmic candidate hypotheses "
+        "derived from temporal clustering and known architectural failure patterns. Downstream logging delays can "
+        "sometimes mask upstream origins. Use the verification checklists below to inspect infrastructure metrics."
+    )
+
+    # B. Incident Clusters
+    st.subheader("⏱️ Correlated Incident Clusters")
+    st.caption(
+        "Error events occurring within close temporal proximity (< 120s sliding window) are grouped into cascading failure clusters."
+    )
+
+    for inc in correlated_events:
+        inc_id = inc.get("incident_id") or 1
+        start_ts = inc.get("start_time") or "N/A"
+        end_ts = inc.get("end_time") or "N/A"
+        dur = _safe_float(inc.get("duration_seconds"), default=0.0)
+        svcs = inc.get("services") or []
+        err_cnt = _safe_int(inc.get("error_count"), default=0)
+
+        # Identify if any matched pattern relates to this cluster
+        matched_pat_name = "General Cascade"
+        for p in matched_patterns:
+            if p.get("suspected_root_cause_service") in svcs or any(s in svcs for s in p.get("affected_services", [])):
+                matched_pat_name = p.get("pattern_name", "Known Pattern")
+                break
+
+        with st.expander(f"📍 Incident #{inc_id} ({start_ts} to {end_ts}) — {err_cnt} error(s) across {len(svcs)} service(s)"):
+            c_m1, c_m2, c_m3 = st.columns(3)
+            c_m1.caption(f"**Duration:** `{dur:.1f}s`")
+            c_m2.caption(f"**Correlated Events:** `{err_cnt}`")
+            c_m3.caption(f"**Pattern Signature:** `{matched_pat_name}`")
+
+            st.write("**Involved Services:** " + ", ".join(f"`{s}`" for s in svcs))
+            if "records" in inc and inc["records"]:
+                rec_rows = [
+                    {"Timestamp": r.get("timestamp"), "Service": r.get("service"), "Level": r.get("level"), "Message": r.get("message")}
+                    for r in inc["records"]
+                ]
+                st.dataframe(pd.DataFrame(rec_rows), hide_index=True)
+
+    # C. Ranked Root-Cause Hypotheses
+    st.subheader("🎯 Ranked Root-Cause Hypotheses")
+    st.caption(
+        "Candidates evaluated via Patient Zero chronology (+25), architectural pattern matching (+25), "
+        "blast radius breadth (+10), message repetition (+15), and missing evidence penalties (-15)."
+    )
+
+    for rank_idx, cause in enumerate(ranked_causes, start=1):
+        candidate = cause.get("candidate_service") or "unknown"
+        possible_cause = cause.get("possible_root_cause") or "Unspecified failure"
+        score = _safe_float(cause.get("confidence_score"), default=0.0)
+        level = cause.get("confidence_level") or "Low"
+        affected_svcs = cause.get("affected_services") or []
+        first_ts = cause.get("first_observed_timestamp") or "N/A"
+        breakdown = cause.get("confidence_breakdown") or {}
+        evidence_sup = cause.get("evidence_supporting") or []
+        evidence_against = cause.get("evidence_against") or []
+        steps = cause.get("recommended_verification_steps") or []
+
+        rank_badge = "🥇 Primary Candidate" if rank_idx == 1 else f"Candidate #{rank_idx}"
+        confidence_color = "🟢" if score >= 75.0 else ("🟠" if score >= 50.0 else "⚪")
+
+        with st.container():
+            st.markdown(f"#### {rank_badge}: `{candidate}` — {confidence_color} {score:.1f}% Confidence ({level})")
+            st.markdown(f"**Suspected Mechanism:** {possible_cause}")
+            st.caption(
+                f"🏷️ **Classification:** Hypothesis (Rule-Based Heuristic) | "
+                f"📅 **First Observed Failure:** `{first_ts}` | "
+                f"🌐 **Affected Cascade:** {', '.join(f'`{s}`' for s in affected_svcs)}"
+            )
+
+            # Confidence visual bar
+            st.progress(min(max(score / 100.0, 0.0), 1.0))
+
+            # Expandable Scoring Breakdown
+            with st.expander(f"📊 Confidence Scoring Breakdown for `{candidate}`"):
+                if breakdown:
+                    b_cols = st.columns(len(breakdown))
+                    for i, (k, v) in enumerate(breakdown.items()):
+                        title = k.replace("_", " ").title()
+                        if isinstance(v, dict):
+                            raw_pts = v.get("points")
+                            pts = _safe_float(raw_pts, default=0.0)
+                            raw_max_pts = v.get("max_points")
+                            max_pts = _safe_float(raw_max_pts, default=None)
+                            val_str = f"{pts:+.1f} pts"
+                            if max_pts is not None:
+                                val_str += f" / {max_pts:.0f}"
+                            b_cols[i].metric(title, val_str)
+                            reason = v.get("reason")
+                            if not reason and "reasons" in v and v["reasons"]:
+                                reason = v["reasons"][0]
+                            if reason:
+                                b_cols[i].caption(str(reason))
+                        elif isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, (bool, np.bool_)):
+                            num_v = _safe_float(v, default=None)
+                            if num_v is not None:
+                                b_cols[i].metric(title, f"{num_v:+.1f} pts")
+                            else:
+                                b_cols[i].metric(title, str(v))
+                        else:
+                            b_cols[i].metric(title, str(v))
+                else:
+                    st.caption("No scoring breakdown available.")
+
+            # D. Supporting Evidence vs Counter-Evidence (Two-Column Layout)
+            col_sup, col_against = st.columns(2)
+            with col_sup:
+                st.markdown("##### ✅ Supporting Evidence")
+                if evidence_sup:
+                    for ev in evidence_sup:
+                        st.markdown(f"- {ev}")
+                else:
+                    st.caption("No positive evidence logged.")
+
+            with col_against:
+                st.markdown("##### ⚠️ Counter-Evidence & Cautions")
+                if evidence_against:
+                    for ca in evidence_against:
+                        st.markdown(f"- {ca}")
+                else:
+                    st.caption("No counter-evidence noted.")
+
+            # E. Verification & Troubleshooting Checklist
+            if steps:
+                st.markdown("##### 📋 Recommended Verification & Debugging Steps")
+                for s_idx, step in enumerate(steps, start=1):
+                    st.markdown(f"- [ ] **Step {s_idx}:** {step}")
+
+            st.markdown("---")
+
+    # F. Warnings and Observability Limitations
+    with st.expander("⚠️ Engine Warnings & Observability Limitations"):
+        if rca_result.get("warnings"):
+            for w in rca_result["warnings"]:
+                st.warning(f"Engine Warning: {w}")
+        st.markdown(
+            "- **Rule-Based Heuristics:** Root-cause candidates are determined deterministically using log timestamps and pattern keywords. "
+            "They represent probabilistic hypotheses, not absolute causal certainty.\n"
+            "- **Downstream Masking:** Logging latencies, async queue workers, or batching may cause downstream services to log errors before upstream services.\n"
+            "- **External Dependencies:** Failures originating in unmonitored infrastructure (hypervisors, cloud VPCs, external payment gateways) "
+            "cannot be observed directly and must be verified using the checklist above."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Dashboard UI Rendering Sections
 # ---------------------------------------------------------------------------
 def show_header(
@@ -870,26 +1390,36 @@ def show_data_source_controls():
         if uploaded_file is not None:
             # Check file size limit
             if uploaded_file.size > MAX_UPLOAD_SIZE_BYTES:
+                reset_uploaded_file_state()
                 st.sidebar.error(f"File too large! Max file size is {MAX_UPLOAD_SIZE_BYTES // (1024*1024)} MB.")
             else:
                 # Avoid re-parsing the exact same file upload on every rerun
+                file_bytes = uploaded_file.getvalue()
+                current_hash = compute_uploaded_file_hash(file_bytes)
                 last_name = st.session_state.get("uploaded_file_name")
-                if last_name != uploaded_file.name or st.session_state.get("uploaded_logs_df") is None:
+                last_hash = st.session_state.get("uploaded_file_hash")
+                if should_reparse_uploaded_file(
+                    uploaded_df=st.session_state.get("uploaded_logs_df"),
+                    last_filename=last_name,
+                    current_filename=uploaded_file.name,
+                    last_hash=last_hash,
+                    current_hash=current_hash,
+                ):
                     try:
-                        raw_content = uploaded_file.getvalue().decode("utf-8", errors="replace")
+                        raw_content = file_bytes.decode("utf-8", errors="replace")
                         parsed_df, summary = parse_uploaded_log_file(raw_content, filename=uploaded_file.name)
                         st.session_state["uploaded_logs_df"] = parsed_df
                         st.session_state["uploaded_file_summary"] = summary
                         st.session_state["uploaded_file_name"] = uploaded_file.name
+                        st.session_state["uploaded_file_hash"] = current_hash
                     except Exception as e:
+                        reset_uploaded_file_state()
                         st.sidebar.error(f"Error parsing file: {e}")
 
         # Display clear file button if uploaded file exists
         if st.session_state.get("uploaded_logs_df") is not None:
             if st.sidebar.button("🗑️ Clear Uploaded File"):
-                st.session_state["uploaded_logs_df"] = None
-                st.session_state["uploaded_file_summary"] = None
-                st.session_state["uploaded_file_name"] = None
+                reset_uploaded_file_state()
                 st.rerun()
 
     return current_mode
@@ -996,13 +1526,13 @@ def show_sidebar_filters(logs: pd.DataFrame):
 
 
 def show_error_spike_section(
-    filtered_logs: pd.DataFrame,
+    active_logs: pd.DataFrame,
     window_minutes: int = DEFAULT_SPIKE_WINDOW_MINUTES,
     error_threshold: int = DEFAULT_SPIKE_ERROR_THRESHOLD,
 ) -> None:
     """Draw the real-time rolling error spike detection section."""
     st.header("⚡ Real-Time Error Spike Detection")
-    st.caption("Monitors the velocity of ERROR events within a rolling time window (Milestone 2).")
+    st.caption("Monitors ERROR velocity across all active log records, independent of sidebar display filters.")
 
     with st.expander("How does rolling spike detection work?"):
         st.markdown(
@@ -1014,14 +1544,18 @@ def show_error_spike_section(
             "⚠️ *An error spike flags an active anomaly for investigation, but is not definitive proof of root cause.*"
         )
 
+    if active_logs.empty:
+        st.info("ℹ️ **No log records available** to evaluate error spikes in the rolling window.")
+        return
+
     spikes = detect_rolling_error_spikes(
-        filtered_logs, window_minutes=window_minutes, error_threshold=error_threshold
+        active_logs, window_minutes=window_minutes, error_threshold=error_threshold
     )
 
     if spikes.empty:
         st.success(
-            f"🟢 **No error spikes detected** in the last {window_minutes} minutes "
-            f"(Threshold: {error_threshold} errors). All services operating within expected rates."
+            f"🟢 **No error spikes detected** in the active log dataset within the last {window_minutes} minutes "
+            f"(Threshold: {error_threshold} errors)."
         )
     else:
         st.error(f"🚨 **{len(spikes)} Service Error Spike(s) Detected!**")
@@ -1187,6 +1721,12 @@ def main() -> None:
     if "uploaded_file_name" not in st.session_state:
         st.session_state["uploaded_file_name"] = None
 
+    if "uploaded_file_hash" not in st.session_state:
+        st.session_state["uploaded_file_hash"] = None
+
+    if "rca_cache" not in st.session_state:
+        st.session_state["rca_cache"] = {}
+
     # Step 1: Sidebar Data Source Selector
     mode = show_data_source_controls()
 
@@ -1252,8 +1792,11 @@ def main() -> None:
     is_filtered = len(filtered_logs) != len(active_logs)
     show_summary_metrics(filtered_logs, is_filtered=is_filtered)
 
-    # Real-Time Rolling Error Spike Detection
-    show_error_spike_section(filtered_logs, window_minutes=window_minutes, error_threshold=error_threshold)
+    # Real-Time Rolling Error Spike Detection (Operational: Evaluates complete active dataset)
+    show_error_spike_section(active_logs, window_minutes=window_minutes, error_threshold=error_threshold)
+
+    # Automated Root Cause Analysis (Milestone 4 - Evaluates complete active dataset)
+    show_root_cause_analysis_section(active_logs, mode=mode)
 
     # Tabular Log Explorer & Severity Chart
     show_log_table_and_chart(filtered_logs)
