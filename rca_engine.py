@@ -8,6 +8,7 @@ patient-zero identification, and transparent confidence scoring for distributed 
 All functions are pure, deterministic, and operate 100% offline without external APIs.
 """
 
+import warnings as py_warnings
 from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
@@ -49,7 +50,9 @@ def _validate_and_prepare_logs(logs_df: Any) -> Tuple[Optional[pd.DataFrame], Li
 
     # Parse and normalize timestamps to timezone-naive datetime
     try:
-        clean_df["timestamp"] = pd.to_datetime(clean_df["timestamp"], errors="coerce")
+        with py_warnings.catch_warnings():
+            py_warnings.filterwarnings("ignore", category=UserWarning, message="Could not infer format")
+            clean_df["timestamp"] = pd.to_datetime(clean_df["timestamp"], errors="coerce")
         # Strip timezone if present to ensure uniform comparisons
         if hasattr(clean_df["timestamp"].dt, "tz") and clean_df["timestamp"].dt.tz is not None:
             clean_df["timestamp"] = clean_df["timestamp"].dt.tz_localize(None)

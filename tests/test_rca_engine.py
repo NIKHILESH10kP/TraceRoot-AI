@@ -5,6 +5,8 @@ Unit tests for TraceRoot AI Rule-Based Root Cause Analysis (RCA) Engine.
 All tests are pure, deterministic, and execute completely offline without external APIs.
 """
 
+import warnings as py_warnings
+
 import pandas as pd
 import pytest
 
@@ -318,6 +320,27 @@ def test_malformed_timestamps():
     assert result["total_errors"] == 1
     assert any("Ignored 1 record(s) with invalid" in w for w in result["warnings"])
     assert result["ranked_causes"][0]["candidate_service"] == "order-service"
+
+
+def test_malformed_timestamps_emits_no_pandas_user_warning():
+    """Verify that unparseable timestamps do not emit unhandled Pandas UserWarnings."""
+    records = [
+        ("CORRUPT_TIMESTAMP_STRING", "ERROR", "payment-service", "Payment failed"),
+        ("2026-10-27 10:05:00", "ERROR", "order-service", "Order failed"),
+    ]
+    df = pd.DataFrame(records, columns=["timestamp", "level", "service", "message"])
+
+    with py_warnings.catch_warnings(record=True) as captured:
+        py_warnings.simplefilter("always")
+        result = run_rule_based_rca(df)
+
+    assert result["status"] == "completed"
+    assert result["total_errors"] == 1
+    user_warnings = [
+        w for w in captured
+        if issubclass(w.category, UserWarning) and "format" in str(w.message).lower()
+    ]
+    assert len(user_warnings) == 0, f"Unexpected Pandas UserWarning emitted: {user_warnings}"
 
 
 # ---------------------------------------------------------------------------
